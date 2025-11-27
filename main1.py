@@ -551,14 +551,7 @@ def compute_security_modified_dietz(
     holdings: pd.DataFrame,
     horizons=HORIZONS,
 ) -> pd.DataFrame:
-    """
-    Compute Modified Dietz returns for each security over the given horizons.
 
-    transactions: raw ticker-level flows (no CASH) with columns:
-                  date, ticker, shares, amount
-    prices: price history (columns = tickers, index = dates)
-    holdings: current holdings (for consistency / sanity checks)
-    """
     if transactions.empty:
         return pd.DataFrame(columns=["ticker"] + list(horizons))
 
@@ -566,12 +559,12 @@ def compute_security_modified_dietz(
     earliest_price = prices.index.min()
 
     rows = []
+
     for t in sorted(transactions["ticker"].unique()):
         if t == "CASH":
             continue
-
         if t not in prices.columns:
-            continue  # no price data
+            continue
 
         tx_all = transactions[transactions["ticker"] == t].copy()
         if tx_all.empty:
@@ -591,7 +584,10 @@ def compute_security_modified_dietz(
         }
 
         for h in horizons:
-            # Determine start date & required lived_days for this horizon
+
+            # ------------------------------
+            # Step 1 — Horizon window logic
+            # ------------------------------
             if h == "1D":
                 start = as_of - timedelta(days=1)
                 horizon_days = 1
@@ -626,15 +622,28 @@ def compute_security_modified_dietz(
                 row[h] = np.nan
                 continue
 
-            # Require that we've actually held the security for the full horizon
+            # ------------------------------
+            # Step 2 — HARD GATE (fix)
+            # ------------------------------
             lived_days = (as_of - first_tx_date).days + 1
             if lived_days < horizon_days:
                 row[h] = np.nan
                 continue
 
-            # Clamp start to earliest price and first trade date
+            # ------------------------------
+            # Step 3 — Clamp start AND do NOT compute if clamping
+            #         invalidates full horizon (critical fix)
+            # ------------------------------
             effective_start = max(start, earliest_price, first_tx_date)
 
+            # If effective_start > start, then we do NOT have the full horizon
+            if effective_start > start:
+                row[h] = np.nan
+                continue
+
+            # ------------------------------
+            # Step 4 — Safe MD computation
+            # ------------------------------
             md_ret = modified_dietz_for_ticker_window(
                 t,
                 price_series,
@@ -647,6 +656,7 @@ def compute_security_modified_dietz(
         rows.append(row)
 
     return pd.DataFrame(rows)
+
 
 def run_engine():
     """
