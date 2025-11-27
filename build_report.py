@@ -188,15 +188,7 @@ def build_report():
         else:
             return "N/A"
 
-        # ----- 2. Find true PV start WITHOUT "nearest" (prevents spikes) -----
-        # We pick the FIRST pv index >= raw_start.
-        idx = pv.index.searchsorted(raw_start)
-
-        # Window doesn’t exist → N/A
-        if idx == len(pv.index):
-            return "N/A"
-
-        start = pv.index[idx]
+        start = pv.index[pv.index.get_indexer([raw_start], method="nearest")[0]]
 
         # If start >= as_of → invalid window
         if start >= as_of:
@@ -290,9 +282,14 @@ def build_report():
 
     # Helper: compute P/L for a ticker inside a horizon window
     def compute_ticker_pl(ticker, h):
+        """
+        Correct economic P/L for a single ticker over a horizon.
+        P/L = MV_end – MV_start – net_internal_flows(start, end)
+        """
         if ticker == "CASH":
             return "N/A"
 
+        # price series
         if ticker not in prices.columns:
             return "N/A"
         series = prices[ticker].dropna()
@@ -301,7 +298,7 @@ def build_report():
 
         as_of = series.index.max()
 
-        # Horizon → raw start
+        # ----- Determine raw start date -----
         if h == "1D":
             raw_start = as_of - pd.Timedelta(days=1)
         elif h == "1W":
@@ -316,37 +313,66 @@ def build_report():
             raw_start = as_of - pd.Timedelta(days=180)
         elif h == "YTD":
             raw_start = as_of.replace(month=1, day=1)
+        elif h == "1Y":
+            raw_start = as_of - pd.Timedelta(days=365)
         else:
             return "N/A"
 
-        idx = series.index.searchsorted(raw_start)
-        if idx >= len(series):
-            return "N/A"
+        # ----- Correct valid-trading-date logic -----
+        idx = series.index.get_indexer([raw_start], method="backfill")[0]
+        if idx == -1:
+            idx = series.index.get_indexer([raw_start], method="ffill")[0]
         start = series.index[idx]
+
         if start >= as_of:
             return "N/A"
 
-        # Ensure ticker existed for this window via sec_full MD return
-        try:
-            md_val = sec_full.loc[sec_full["ticker"] == ticker, h].iloc[0]
-            if safe(md_val) == "N/A":
-                return "N/A"
-        except:
+        # ----- Load transactions -----
+        tx = load_transactions_raw()
+        tx = tx[tx["ticker"] == ticker].copy()
+        tx = tx.sort_values("date")
+
+        if tx.empty:
             return "N/A"
 
-        px_start = float(series.loc[start])
-        px_end   = float(series.loc[as_of])
+        first_trade = tx["date"].min()
 
+        # Not owned at start → no P/L
+        if first_trade > start:
+            return "N/A"
+
+        start = max(start, first_trade)
+
+        # ----- Prices -----
+        try:
+            px_start = float(series.loc[start])
+            px_end = float(series.loc[as_of])
+        except Exception:
+            return "N/A"
+
+        # ----- Shares at end -----
         row = sec_only[sec_only["ticker"] == ticker]
         if row.empty:
             return "N/A"
-        shares = float(row["shares"].iloc[0])
+        shares_end = float(row["shares"].iloc[0])
 
-        mv_start = shares * px_start
-        mv_end   = shares * px_end
+        # ----- Shares at start -----
+        mask = tx["date"] <= start
+        shares_start = tx.loc[mask, "shares"].sum() if mask.any() else 0.0
 
-        pl = mv_end - mv_start
+        # ----- Internal flows inside window -----
+        mask2 = (tx["date"] > start) & (tx["date"] < as_of)
+        net_internal = -tx.loc[mask2, "amount"].sum()
+
+        # ----- Economic P/L -----
+        mv_start = shares_start * px_start
+        mv_end = shares_end * px_end
+
+        pl = mv_end - mv_start - net_internal
+
         return fmt_dollar_clean(pl)
+
+
 
     # ---------------------------------------------------------------
     # PERFORMANCE HIGHLIGHTS TABLE
