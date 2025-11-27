@@ -16,7 +16,7 @@ import os
 from config import ETF_SECTOR_MAP
 from collections import defaultdict
 from main1 import load_transactions_raw
-
+from datetime import datetime
 
 # =====================================================================
 # Formatting Helpers (FULL N/A FIX)
@@ -135,7 +135,7 @@ def build_report():
     # =============================================================
     # COVER PAGE
     # =============================================================
-
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H%M")
     doc.add_paragraph("\n\n\n\n")
 
     title = doc.add_paragraph("Portfolio Performance Report")
@@ -144,6 +144,12 @@ def build_report():
     title.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
     subtitle = doc.add_paragraph("Time-Weighted & Money-Weighted Performance (Automated)")
+    created_line = doc.add_paragraph(f"Created for Tom Short — {timestamp}")
+    created_line.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    created_line.runs[0].font.size = Pt(12)
+    created_line.runs[0].italic = True
+    created_line.runs[0].font.color.rgb = RGBColor(100, 100, 100)
+
     subtitle.alignment = WD_ALIGN_PARAGRAPH.CENTER
     subtitle.runs[0].font.size = Pt(14)
     subtitle.runs[0].font.color.rgb = RGBColor(70, 130, 180)
@@ -1748,8 +1754,8 @@ def build_report():
     # SAVE OUTPUT
     # =============================================================
 
-    DOCX_NAME = "Portfolio_Performance_Report.docx"
-    PDF_NAME  = "Portfolio_Performance_Report.pdf"
+    DOCX_NAME = f"Portfolio_Performance_Report_{timestamp}.docx"
+    PDF_NAME  = f"Portfolio_Performance_Report_{timestamp}.pdf"
 
     doc.save(DOCX_NAME)
 
