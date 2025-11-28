@@ -178,7 +178,14 @@ def build_report():
 
         # ----- 1. Determine raw start date -----
         if h == "1D":
-            raw_start = as_of - pd.Timedelta(days=1)
+        # Previous trading day logic (match TWR + MD behavior)
+        pv_dates = pv.index.sort_values()
+        prev_dates = pv_dates[pv_dates < as_of]
+
+        if len(prev_dates) == 0:
+            return "N/A"
+
+        start = prev_dates.max()
         elif h == "1W":
             raw_start = as_of - pd.Timedelta(days=7)
         elif h == "MTD":
@@ -193,8 +200,6 @@ def build_report():
             raw_start = as_of.replace(month=1, day=1)
         else:
             return "N/A"
-
-        start = pv.index[pv.index.get_indexer([raw_start], method="nearest")[0]]
 
         # If start >= as_of → invalid window
         if start >= as_of:
@@ -1771,3 +1776,4 @@ def build_report():
 
 if __name__ == "__main__":
     build_report()
+
