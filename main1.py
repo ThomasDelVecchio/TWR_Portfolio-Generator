@@ -424,10 +424,26 @@ def compute_horizon_twr(
         return compute_period_twr(pv, cf, start, as_of)
 
     # =============================
+    # FIXED 1D: previous trading day → as_of
+    # =============================
+    if label == "1D":
+        pv_dates = pv.index.sort_values()
+        prev_dates = pv_dates[pv_dates < as_of]
+        if len(prev_dates) == 0:
+            return np.nan
+
+        start = prev_dates.max()
+
+        # Inception gating
+        if inception_date > start:
+            return np.nan
+
+        return compute_period_twr(pv, cf, start, as_of)
+  
+    # =============================
     # Other rolling horizons
     # =============================
     days_map = {
-        "1D": 1,
         "1W": 7,
         "1M": 30,
         "3M": 90,
@@ -865,4 +881,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
