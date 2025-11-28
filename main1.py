@@ -589,8 +589,18 @@ def compute_security_modified_dietz(
             # Step 1 — Horizon window logic
             # ------------------------------
             if h == "1D":
-                start = as_of - timedelta(days=1)
-                horizon_days = 1
+                # Find the nearest prior trading day in the price index
+                price_idx = prices.index
+
+                # The last trading day *before* as_of
+                prev_idx = price_idx[price_idx < as_of]
+
+                if len(prev_idx) == 0:
+                    row[h] = np.nan
+                    continue
+
+                start = prev_idx.max()
+                horizon_days = (as_of - start).days
             elif h == "1W":
                 start = as_of - timedelta(days=7)
                 horizon_days = 7
@@ -855,3 +865,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
