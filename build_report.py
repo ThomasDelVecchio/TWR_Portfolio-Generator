@@ -187,6 +187,9 @@ def build_report():
 
             start = prev_dates.max()
 
+            # Safety gate: invalid horizon if start >= as_of
+            if start >= as_of:
+                return "N/A"
         else:
             if h == "1W":
                 raw_start = as_of - pd.Timedelta(days=7)
@@ -1776,5 +1779,6 @@ def build_report():
 
 if __name__ == "__main__":
     build_report()
+
 
 
