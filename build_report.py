@@ -312,31 +312,41 @@ def build_report():
 
         as_of = series.index.max()
 
-        # ----- Determine raw start date -----
+        # ----- Determine correct start date -----
         if h == "1D":
-            raw_start = as_of - pd.Timedelta(days=1)
-        elif h == "1W":
-            raw_start = as_of - pd.Timedelta(days=7)
-        elif h == "MTD":
-            raw_start = as_of.replace(day=1)
-        elif h == "1M":
-            raw_start = as_of - pd.Timedelta(days=30)
-        elif h == "3M":
-            raw_start = as_of - pd.Timedelta(days=90)
-        elif h == "6M":
-            raw_start = as_of - pd.Timedelta(days=180)
-        elif h == "YTD":
-            raw_start = as_of.replace(month=1, day=1)
-        elif h == "1Y":
-            raw_start = as_of - pd.Timedelta(days=365)
-        else:
-            return "N/A"
+            # Use previous trading day (match portfolio + MD logic)
+            series_dates = series.index.sort_values()
+            prev_dates = series_dates[series_dates < as_of]
 
-        # ----- Correct valid-trading-date logic -----
-        idx = series.index.get_indexer([raw_start], method="backfill")[0]
-        if idx == -1:
-            idx = series.index.get_indexer([raw_start], method="ffill")[0]
-        start = series.index[idx]
+            if len(prev_dates) == 0:
+                return "N/A"
+
+            start = prev_dates.max()
+
+        else:
+            # Rolling horizons
+            if h == "1W":
+                raw_start = as_of - pd.Timedelta(days=7)
+            elif h == "MTD":
+                raw_start = as_of.replace(day=1)
+            elif h == "1M":
+                raw_start = as_of - pd.Timedelta(days=30)
+            elif h == "3M":
+                raw_start = as_of - pd.Timedelta(days=90)
+            elif h == "6M":
+                raw_start = as_of - pd.Timedelta(days=180)
+            elif h == "YTD":
+                raw_start = as_of.replace(month=1, day=1)
+            elif h == "1Y":
+                raw_start = as_of - pd.Timedelta(days=365)
+            else:
+                return "N/A"
+
+            idx = series.index.get_indexer([raw_start], method="backfill")[0]
+            if idx == -1:
+                idx = series.index.get_indexer([raw_start], method="ffill")[0]
+            start = series.index[idx]
+
 
         if start >= as_of:
             return "N/A"
@@ -1779,6 +1789,7 @@ def build_report():
 
 if __name__ == "__main__":
     build_report()
+
 
 
 
