@@ -178,32 +178,32 @@ def build_report():
 
         # ----- 1. Determine raw start date -----
         if h == "1D":
-        # Previous trading day logic (match TWR + MD behavior)
-        pv_dates = pv.index.sort_values()
-        prev_dates = pv_dates[pv_dates < as_of]
+            # Previous trading day logic (match TWR + MD behavior)
+            pv_dates = pv.index.sort_values()
+            prev_dates = pv_dates[pv_dates < as_of]
 
-        if len(prev_dates) == 0:
-            return "N/A"
+            if len(prev_dates) == 0:
+                return "N/A"
 
-        start = prev_dates.max()
-        elif h == "1W":
-            raw_start = as_of - pd.Timedelta(days=7)
-        elif h == "MTD":
-            raw_start = as_of.replace(day=1)
-        elif h == "1M":
-            raw_start = as_of - pd.Timedelta(days=30)
-        elif h == "3M":
-            raw_start = as_of - pd.Timedelta(days=90)
-        elif h == "6M":
-            raw_start = as_of - pd.Timedelta(days=180)
-        elif h == "YTD":
-            raw_start = as_of.replace(month=1, day=1)
+            start = prev_dates.max()
+
         else:
-            return "N/A"
+            if h == "1W":
+                raw_start = as_of - pd.Timedelta(days=7)
+            elif h == "MTD":
+                raw_start = as_of.replace(day=1)
+            elif h == "1M":
+                raw_start = as_of - pd.Timedelta(days=30)
+            elif h == "3M":
+                raw_start = as_of - pd.Timedelta(days=90)
+            elif h == "6M":
+                raw_start = as_of - pd.Timedelta(days=180)
+            elif h == "YTD":
+                raw_start = as_of.replace(month=1, day=1)
+            else:
+                return "N/A"
 
-        # If start >= as_of → invalid window
-        if start >= as_of:
-            return "N/A"
+            start = pv.index[pv.index.get_indexer([raw_start], method="nearest")[0]]
 
         mv_start = float(pv.loc[start])
         mv_end = float(pv.loc[as_of])
@@ -1776,4 +1776,5 @@ def build_report():
 
 if __name__ == "__main__":
     build_report()
+
 
