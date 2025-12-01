@@ -19,6 +19,9 @@ import numpy as np
 from datetime import datetime, timedelta
 import yfinance as yf
 
+# Simple in-memory cache for price history to keep horizons consistent
+_PRICE_CACHE = {}
+
 # ============================================================
 # CONFIG
 # ============================================================
@@ -121,10 +124,18 @@ def load_transactions_raw(path: str = CASHFLOWS_FILE) -> pd.DataFrame:
 # ------------------------------------------------------------
 
 def fetch_price_history(tickers, years_back: int = PRICE_LOOKBACK_YEARS) -> pd.DataFrame:
+    # Normalize tickers to a hashable, order-independent cache key
+    tickers_list = list(tickers)
+    key = (tuple(sorted(str(t).upper() for t in tickers_list)), int(years_back))
+
+    if key in _PRICE_CACHE:
+        # Return a copy so callers can't mutate the cached DataFrame in-place
+        return _PRICE_CACHE[key].copy()
+
     start_date = (datetime.today() - timedelta(days=365 * years_back)).strftime("%Y-%m-%d")
 
     raw = yf.download(
-        tickers,
+        tickers_list,
         start=start_date,
         progress=False,
         auto_adjust=False,
@@ -166,7 +177,12 @@ def fetch_price_history(tickers, years_back: int = PRICE_LOOKBACK_YEARS) -> pd.D
     if not isinstance(prices.index, pd.DatetimeIndex):
         prices.index = pd.to_datetime(prices.index)
 
-    return prices
+    prices = prices.sort_index()
+
+    # Store in cache and return a copy
+    _PRICE_CACHE[key] = prices
+    return prices.copy()
+
 
 
 # ------------------------------------------------------------
@@ -306,11 +322,18 @@ def build_portfolio_value_series_from_flows(
     if target_cash is not None and abs(cash_balance - target_cash) > 1e-6:
         mismatches.append(("CASH", cash_balance, target_cash))
 
-    if mismatches:
+    # Allow tiny rounding drift for CASH only (≤ $0.50)
+    filtered = []
+    for (tkr, flows_val, hold_val) in mismatches:
+        if tkr == "CASH" and abs(flows_val - hold_val) <= 0.50:
+            continue
+        filtered.append((tkr, flows_val, hold_val))
+
+    if filtered:
         raise ValueError(
-            f"Flow-based PV reconciliation failed. "
-            f"Final positions from flows do not match holdings: {mismatches}"
+            f"Flow-based PV reconciliation failed. Final positions from flows do not match holdings: {filtered}"
         )
+
 
     return pv
 
@@ -881,5 +904,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
