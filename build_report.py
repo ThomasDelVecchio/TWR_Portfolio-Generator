@@ -173,10 +173,12 @@ def build_report():
 
     # REAL P/L calculator using pv and external cashflows
     # P/L = MV_end − MV_start − net_external_flows(start, end)
+    # REAL P/L calculator using pv and external cashflows
+    # P/L = MV_end − MV_start − net_external_flows(start, end)
     def compute_horizon_pl(h):
         as_of = pv.index.max()
 
-        # ----- 1. Determine raw start date -----
+        # ----- 1. Determine start date on PV index -----
         if h == "1D":
             # Previous trading day logic (match TWR + MD behavior)
             pv_dates = pv.index.sort_values()
@@ -206,7 +208,15 @@ def build_report():
             else:
                 return "N/A"
 
-            start = pv.index[pv.index.get_indexer([raw_start], method="nearest")[0]]
+            # Map raw_start to the last PV date <= raw_start
+            pv_dates = pv.index.sort_values()
+            idx = pv_dates.searchsorted(raw_start, side="right") - 1
+            if idx < 0:
+                idx = 0
+            start = pv_dates[idx]
+
+            if start >= as_of:
+                return "N/A"
 
         mv_start = float(pv.loc[start])
         mv_end = float(pv.loc[as_of])
@@ -220,7 +230,6 @@ def build_report():
         # ----- 4. True economic P/L -----
         pl = mv_end - mv_start - net_flows
         return fmt_dollar_clean(pl)
-
 
 
     # Build vertical snapshot rows
@@ -1011,22 +1020,26 @@ def build_report():
         "Other": None,  # ignore "Other" buckets
     }
 
-    for _, row in sec_only.iterrows():
-        ticker = row["ticker"]
-        weight_pct = row["allocation"]  # current is string like "+25.0%"
-        weight_pct = float(weight_pct.replace("%","").replace("+",""))
+    # Use raw market values and exclude CASH from the denominator so that
+    # sector weights are based on invested assets only.
+    sector_universe = sec_only[sec_only["ticker"].isin(ETF_SECTOR_MAP.keys())].copy()
+    sector_universe = sector_universe[sector_universe["value"] > 0]
 
+    total_invested = sector_universe["value"].sum()
 
-        # Skip CASH or non-ETF positions if desired
-        if ticker not in ETF_SECTOR_MAP:
-            continue
+    if total_invested > 0:
+        for _, row in sector_universe.iterrows():
+            ticker = row["ticker"]
+            # weight of this holding as % of invested (non-CASH) assets
+            weight_pct = (row["value"] / total_invested) * 100.0
 
-        etf_sectors = ETF_SECTOR_MAP[ticker]
-        for sector, pct in etf_sectors.items():
-            norm_sector = SECTOR_NORMALIZATION.get(sector, sector)
-            if norm_sector is None:
-                continue
-            sector_exposure[norm_sector] += weight_pct * pct / 100.0
+            etf_sectors = ETF_SECTOR_MAP.get(ticker, {})
+            for sector, pct in etf_sectors.items():
+                norm_sector = SECTOR_NORMALIZATION.get(sector, sector)
+                if norm_sector is None:
+                    continue
+                sector_exposure[norm_sector] += weight_pct * pct / 100.0
+
 
     # Convert to sorted DataFrame
     sector_df = pd.DataFrame(
@@ -1789,7 +1802,3 @@ def build_report():
 
 if __name__ == "__main__":
     build_report()
-
-
-
-
