@@ -98,6 +98,23 @@ def build_report():
 
     # Run the engine (unchanged math)
     twr_df, sec_full, class_full, pv = run_engine()
+
+    cf_ext = load_cashflows_external()
+
+    tx_raw = load_transactions_raw()
+
+    twr_df_raw, _, _, pv_raw = run_engine()
+    
+    # === Inception date (same logic as run_engine) ===
+    dates = []
+    if not cf_ext.empty:
+        dates.append(cf_ext["date"].min())
+    if not tx_raw.empty:
+        dates.append(tx_raw["date"].min())
+    dates.append(pv.index.min())
+
+    inception_date = min(dates)
+
     
     # External cashflows for proper P/L (deposits/withdrawals only)
     cf_ext = load_cashflows_external()
@@ -173,63 +190,132 @@ def build_report():
 
     # REAL P/L calculator using pv and external cashflows
     # P/L = MV_end − MV_start − net_external_flows(start, end)
-    # REAL P/L calculator using pv and external cashflows
-    # P/L = MV_end − MV_start − net_external_flows(start, end)
-    def compute_horizon_pl(h):
-        as_of = pv.index.max()
+    
+    def get_horizon_start(label: str) -> pd.Timestamp | None:
+        """
+        Canonical horizon start, mirroring compute_horizon_twr logic.
 
-        # ----- 1. Determine start date on PV index -----
-        if h == "1D":
-            # Previous trading day logic (match TWR + MD behavior)
-            pv_dates = pv.index.sort_values()
-            prev_dates = pv_dates[pv_dates < as_of]
+        Returns:
+          - pd.Timestamp start if horizon is valid
+          - None if horizon should be treated as 'insufficient data'
+        """
+        pv_idx = pv.index.sort_values()
+        as_of = pv_idx.max()
 
+        # ============= MTD =============
+        if label == "MTD":
+            prior_month_end = as_of.replace(day=1) - pd.Timedelta(days=1)
+            prev_dates = pv_idx[pv_idx <= prior_month_end]
             if len(prev_dates) == 0:
-                return "N/A"
+                return None
 
             start = prev_dates.max()
+            full_horizon_days = (as_of - start).days + 1
+            lived_days = (as_of - inception_date).days + 1
 
-            # Safety gate: invalid horizon if start >= as_of
+            if lived_days < full_horizon_days:
+                return None
             if start >= as_of:
-                return "N/A"
-        else:
-            if h == "1W":
-                raw_start = as_of - pd.Timedelta(days=7)
-            elif h == "MTD":
-                raw_start = as_of.replace(day=1)
-            elif h == "1M":
-                raw_start = as_of - pd.Timedelta(days=30)
-            elif h == "3M":
-                raw_start = as_of - pd.Timedelta(days=90)
-            elif h == "6M":
-                raw_start = as_of - pd.Timedelta(days=180)
-            elif h == "YTD":
-                raw_start = as_of.replace(month=1, day=1)
-            else:
-                return "N/A"
+                return None
 
-            # Map raw_start to the last PV date <= raw_start
-            pv_dates = pv.index.sort_values()
-            idx = pv_dates.searchsorted(raw_start, side="right") - 1
-            if idx < 0:
-                idx = 0
-            start = pv_dates[idx]
+            return start
 
+        # ============= YTD =============
+        if label == "YTD":
+            year_start = as_of.replace(month=1, day=1)
+
+            # Same institutional rule as compute_horizon_twr:
+            if inception_date > year_start:
+                return None
+
+            start = year_start
             if start >= as_of:
-                return "N/A"
+                return None
+
+            return start
+
+        # ============= 1D =============
+        if label == "1D":
+            prev_dates = pv_idx[pv_idx < as_of]
+            if len(prev_dates) == 0:
+                return None
+
+            start = prev_dates.max()
+            if inception_date > start:
+                return None
+
+            return start
+
+        # ============= 1M (calendar) =============
+        if label == "1M":
+            one_month_prior = as_of - pd.DateOffset(months=1)
+            idx_pos = pv_idx.searchsorted(one_month_prior)
+            if idx_pos >= len(pv_idx):
+                return None
+
+            start = pv_idx[idx_pos]
+            full_horizon_days = (as_of - start).days + 1
+            lived_days = (as_of - inception_date).days + 1
+
+            if lived_days < full_horizon_days:
+                return None
+            if start >= as_of:
+                return None
+
+            return start
+
+        # ============= Rolling 1W/3M/6M/1Y/3Y/5Y =============
+        days_map = {
+            "1W": 7,
+            "3M": 90,
+            "6M": 180,
+            "1Y": 365,
+            "3Y": 365 * 3,
+            "5Y": 365 * 5,
+        }
+
+        if label not in days_map:
+            return None
+
+        full_horizon_days = days_map[label]
+        start = as_of - pd.Timedelta(days=full_horizon_days)
+        if start < pv.index.min():
+            return None
+        lived_days = (as_of - inception_date).days + 1
+        if lived_days < full_horizon_days:
+            return None
+
+        if start < inception_date:
+            start = inception_date
+        if start >= as_of:
+            return None
+
+        return start
+
+
+    def compute_horizon_pl(h):
+        """
+        Portfolio P/L over horizon h using the SAME horizon start as TWR.
+        P/L = MV_end − MV_start − net_external_flows(start, end)
+        """
+        as_of = pv.index.max()
+
+        start = get_horizon_start(h)
+        if start is None or start >= as_of:
+            return "N/A"
 
         mv_start = float(pv.loc[start])
         mv_end = float(pv.loc[as_of])
 
-        # ----- 3. Confine flows INSIDE the strict window (start, as_of) -----
+        # flows strictly inside (start, as_of)
         net_flows = 0.0
         if cf_ext is not None and not cf_ext.empty:
             mask = (cf_ext["date"] > start) & (cf_ext["date"] < as_of)
             net_flows = float(cf_ext.loc[mask, "amount"].sum())
 
-        # ----- 4. True economic P/L -----
         pl = mv_end - mv_start - net_flows
         return fmt_dollar_clean(pl)
+
 
 
     # Build vertical snapshot rows
@@ -319,42 +405,47 @@ def build_report():
         if series.empty:
             return "N/A"
 
-        as_of = series.index.max()
+        as_of_port = pv.index.max()
+        as_of_price = series.index.max()
+        as_of = min(as_of_port, as_of_price)
 
-        # ----- Determine correct start date -----
-        if h == "1D":
-            # Use previous trading day (match portfolio + MD logic)
-            series_dates = series.index.sort_values()
-            prev_dates = series_dates[series_dates < as_of]
+        # === Unified portfolio horizon start ===
+        raw_start = get_horizon_start(h)
+        if raw_start is None or raw_start >= as_of:
+            return "N/A"
 
-            if len(prev_dates) == 0:
+        # Map portfolio horizon start onto this ticker's price series
+        series_dates = series.index.sort_values()
+
+        # === Map portfolio horizon start to this ticker's price series ===
+
+        # MTD uses same "last prior price" logic
+        if h == "MTD":
+            # raw_start = prior-month-end; use FIRST price *after* that date
+            idx = series_dates.searchsorted(raw_start)
+            if idx >= len(series_dates):
                 return "N/A"
+            start = series_dates[idx]
 
-            start = prev_dates.max()
 
+        # 1D MUST use strict previous trading day only
+        elif h == "1D":
+            # 1D should match the portfolio horizon exactly: raw_start is the
+            # previous trading day at the portfolio level, so we want the
+            # first price on or AFTER raw_start for this ticker.
+            idx = series_dates.searchsorted(raw_start)
+            if idx >= len(series_dates):
+                return "N/A"
+            start = series_dates[idx]
+
+
+        #   All other horizons: nearest prior price
         else:
-            # Rolling horizons
-            if h == "1W":
-                raw_start = as_of - pd.Timedelta(days=7)
-            elif h == "MTD":
-                raw_start = as_of.replace(day=1)
-            elif h == "1M":
-                raw_start = as_of - pd.Timedelta(days=30)
-            elif h == "3M":
-                raw_start = as_of - pd.Timedelta(days=90)
-            elif h == "6M":
-                raw_start = as_of - pd.Timedelta(days=180)
-            elif h == "YTD":
-                raw_start = as_of.replace(month=1, day=1)
-            elif h == "1Y":
-                raw_start = as_of - pd.Timedelta(days=365)
-            else:
+            idx = series_dates.searchsorted(raw_start, side="right") - 1
+            if idx < 0:
                 return "N/A"
+            start = series_dates[idx]
 
-            idx = series.index.get_indexer([raw_start], method="backfill")[0]
-            if idx == -1:
-                idx = series.index.get_indexer([raw_start], method="ffill")[0]
-            start = series.index[idx]
 
 
         if start >= as_of:
@@ -375,7 +466,10 @@ def build_report():
             return "N/A"
 
         start = max(start, first_trade)
-
+        # MD CONSISTENCY GUARD:
+        # If effective start is later than the benchmark portfolio horizon anchor → N/A
+        if start > raw_start:
+            return "N/A"
         # ----- Prices -----
         try:
             px_start = float(series.loc[start])
@@ -1072,31 +1166,35 @@ def build_report():
     # PORTFOLIO VS BENCHMARKS — MTD & YTD (PRICE RETURN)
     # ---------------------------------------------------------------
 
-    # Load sample holdings for portfolio price history
-    holdings_df = pd.read_csv("sample holdings.csv")
-    holdings_df["ticker"] = holdings_df["ticker"].str.upper()
-    tickers = holdings_df["ticker"].tolist()
+    portfolio_value = pv.copy()
+    portfolio_value.index = pd.to_datetime(portfolio_value.index)
 
-    # Fetch historical prices for portfolio tickers
-    prices = fetch_price_history(tickers)  # assumes fetch_price_history returns DataFrame with dates as index
-    prices.index = pd.to_datetime(prices.index)
-
-    # Compute portfolio daily price returns
-    weights = holdings_df.set_index("ticker")["target_pct"] / 100.0
-    weights = weights.reindex(prices.columns).fillna(0)
-    portfolio_value = (prices * weights).sum(axis=1)
 
     # Current "as of" date
     as_of = portfolio_value.index[-1]
 
-    # ---------------- MTD ----------------
-    mtd_start = as_of.replace(day=1)
-    portfolio_mtd = portfolio_value[portfolio_value.index >= mtd_start]
+    # ---------------- MTD (Institutional: last trading day of prior month) ----------------
+    pv_dates = pv.index
+    mtd_start = get_horizon_start("MTD")
+    if mtd_start is None:
+        mtd_start = pv.index.min()
+
+    # unified anchor for EVERYTHING (portfolio + benchmarks)
+    pv_nonzero = pv[pv > 0]
+    twr_anchor = max(mtd_start, pv_nonzero.index.min())
+
+    portfolio_mtd = portfolio_value[portfolio_value.index >= twr_anchor]
+
     portfolio_mtd = (portfolio_mtd / portfolio_mtd.iloc[0] - 1) * 100
 
+
     # ---------------- YTD ----------------
-    ytd_start = as_of.replace(month=1, day=1)
+    ytd_start = get_horizon_start("YTD")
+    if ytd_start is None:
+        ytd_start = pv.index.min()
+
     portfolio_ytd = portfolio_value[portfolio_value.index >= ytd_start]
+
     portfolio_ytd = (portfolio_ytd / portfolio_ytd.iloc[0] - 1) * 100
 
     # Define benchmark tickers and fetch historical prices
@@ -1115,9 +1213,10 @@ def build_report():
     # Slice and compute MTD/YTD for benchmarks
     benchmark_returns = {}
     for name, series in benchmark_prices.items():
-        # MTD
-        mtd_series = series[series.index >= mtd_start]
+        # MTD (MUST USE twr_anchor)
+        mtd_series = series[series.index >= twr_anchor]
         mtd_cum = (mtd_series / mtd_series.iloc[0] - 1) * 100
+
         # YTD
         ytd_series = series[series.index >= ytd_start]
         ytd_cum = (ytd_series / ytd_series.iloc[0] - 1) * 100
@@ -1129,14 +1228,33 @@ def build_report():
     doc.add_heading("MTD Cumulative Return — Portfolio vs Benchmarks (TWR-Based)", level=2)
 
     # 1) Portfolio TWR cumulative curve (based on pv)
-    pv_nonzero = pv[pv > 0]
+    mtd_start_twr = twr_anchor
 
-    # Find the earliest day in MTD but also ensure portfolio > 0
-    mtd_start_twr = max(mtd_start, pv_nonzero.index[0])
+    # Correct GIPS-compliant daily TWR (flows at start of day)
+    cf_ext_local = load_cashflows_external().copy()
+    daily_ret = []
 
-    pv_mtd = pv[pv.index >= mtd_start_twr]
-    pv_mtd = pv_mtd / pv_mtd.iloc[0] - 1.0
-    pv_mtd *= 100.0   # convert to %
+    pv_dates = pv.index
+    for i in range(1, len(pv_dates)):
+        d0 = pv_dates[i-1]
+        d1 = pv_dates[i]
+
+        flow = cf_ext_local.loc[cf_ext_local["date"] == d1, "amount"].sum()
+        R = (pv.loc[d1] - pv.loc[d0] - flow) / pv.loc[d0]
+        daily_ret.append((d1, R))
+
+
+    # Convert to cumulative TWR curve
+    twr_curve = pd.Series(1.0, index=[d for d,_ in daily_ret])
+    running = 1.0
+    for d,R in daily_ret:
+        running *= (1 + R)
+        twr_curve.loc[d] = running
+
+    # Slice only the MTD part
+    twr_mtd = twr_curve[twr_curve.index >= mtd_start_twr]
+    twr_mtd = (twr_mtd / twr_mtd.iloc[0] - 1) * 100
+
 
     # 2) Benchmarks: ALSO anchored to the same start date as portfolio
     benchmark_map = {
@@ -1166,12 +1284,8 @@ def build_report():
     fig, ax = plt.subplots(figsize=(10, 5))
 
     # Portfolio curve
-    ax.plot(
-        pv_mtd.index,
-        pv_mtd.values,
-        linewidth=2,
-        label="Portfolio (TWR-Based)"
-    )
+    ax.plot(twr_mtd.index, twr_mtd.values, linewidth=2, label="Portfolio (TWR-Based)")
+
 
     # Benchmarks
     for name, series in benchmark_curves_mtd.items():
@@ -1194,7 +1308,7 @@ def build_report():
     paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
     doc.add_paragraph(
-        "Footnote: Portfolio uses true TWR via flow-based PV; benchmarks use price return rebased to the same start date.",
+        "Footnote: Portfolio returns use true GIPS-compliant TWR based on a flow-adjusted, end-of-day PV series (external flows treated at start-of-day). Benchmark returns use simple price return and are rebased to the same start date for comparability.",
         style="Normal"
     ).alignment = WD_ALIGN_PARAGRAPH.CENTER
 
@@ -1207,6 +1321,10 @@ def build_report():
     ax.set_ylabel("Cumulative Return (%)")
     ax.set_title("YTD Cumulative Return — Portfolio vs Benchmarks")
     ax.legend(fontsize=8)
+    import matplotlib.dates as mdates
+    ax.xaxis.set_major_locator(mdates.WeekdayLocator(interval=1))
+    plt.setp(ax.get_xticklabels(), rotation=45, ha='right')
+
     plt.tight_layout()
 
     img_stream = BytesIO()
@@ -1244,24 +1362,37 @@ def build_report():
     }
 
     # determine MTD start (same logic as charts)
-    as_of = pv.index.max()
-    mtd_start = as_of.replace(day=1)
+    mtd_start = twr_anchor
+    mtd_start_twr = twr_anchor
+
+
+
+    # ensures benchmarks use the SAME anchor as portfolio
+    mtd_start_twr = twr_anchor
+
+
 
     bench_rows = []
 
     for name, ticker in benchmarks.items():
         try:
             hist = fetch_price_history([ticker])
-            ser = hist[ticker]
+            ser = hist[ticker].dropna()
 
-            ser = ser[ser.index >= mtd_start]
-            if len(ser) > 1:
-                bench_mtd = (ser.iloc[-1] / ser.iloc[0] - 1) * 100
+            # last benchmark price on or before prev_month_end
+            bench_dates = ser.index
+
+            # Align benchmark series to portfolio’s true MTD anchor
+            mtd_start_twr = twr_anchor
+            mtd_series = ser[ser.index >= twr_anchor]
+
+
+            if len(mtd_series) > 1:
+                bench_mtd = (mtd_series.iloc[-1] / mtd_series.iloc[0] - 1.0) * 100.0
                 bench_mtd_fmt = f"{bench_mtd:.2f}%"
 
-                # Excess return = portfolio TWR – benchmark price return
                 if portfolio_mtd_val not in (None, "N/A"):
-                    port_float = float(portfolio_mtd_val.replace("%", ""))
+                    port_float = float(str(portfolio_mtd_val).replace("%", ""))
                     excess = port_float - bench_mtd
                     excess_fmt = f"{excess:.2f}%"
                 else:
@@ -1269,6 +1400,7 @@ def build_report():
             else:
                 bench_mtd_fmt = "N/A"
                 excess_fmt = "N/A"
+
 
         except:
             bench_mtd_fmt = "N/A"
@@ -1280,6 +1412,7 @@ def build_report():
             bench_mtd_fmt,
             excess_fmt
         ])
+
 
     # Add table
     add_table(
@@ -1313,7 +1446,10 @@ def build_report():
     }
 
     as_of = pv.index.max()
-    ytd_start = as_of.replace(month=1, day=1)
+    ytd_start = get_horizon_start("YTD")
+    if ytd_start is None:
+        ytd_start = pv.index.min()
+
 
     bench_rows_ytd = []
 
