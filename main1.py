@@ -276,21 +276,13 @@ def build_portfolio_value_series_from_flows(
                 cash_balance += row["amount"]
             flow_idx += 1
 
-        # Snapshot PV BEFORE applying flows dated exactly on current_date
-        total = cash_balance
-        for t, qty in positions.items():
-            if t not in prices.columns:
-                raise ValueError(
-                    f"Missing price data for ticker '{t}' while building PV from flows."
-                )
-            px = prices.at[current_date, t]
-            if pd.isna(px):
-                # If price missing for a day, skip contribution from that ticker
-                continue
-            total += qty * float(px)
-        pv.loc[current_date] = total
+        # ------------------------------------------------------------
+        # GIPS-CORRECT ORDER:
+        # 1. Apply flows dated on current_date (start-of-day)
+        # 2. Snapshot PV after flows (end-of-day)
+        # ------------------------------------------------------------
 
-        # Now apply flows dated exactly on current_date
+        # 1. Apply flows that occur exactly on current_date
         while flow_idx < n_flows and raw.loc[flow_idx, "date"] == current_date:
             row = raw.loc[flow_idx]
             t = row["ticker"]
@@ -302,6 +294,21 @@ def build_portfolio_value_series_from_flows(
                 positions[t] += row["shares"]
                 cash_balance += row["amount"]
             flow_idx += 1
+
+        # 2. Snapshot PV AFTER today's flows using end-of-day prices
+        total = cash_balance
+        for t, qty in positions.items():
+            if t not in prices.columns:
+                raise ValueError(
+                    f"Missing price data for ticker '{t}' while building PV from flows."
+                )
+            px = prices.at[current_date, t]
+            if pd.isna(px):
+                continue
+            total += qty * float(px)
+
+        pv.loc[current_date] = total
+
 
     # ----- Sanity check against final holdings -----
     holdings_map = {
@@ -416,18 +423,31 @@ def compute_horizon_twr(
     # MTD: from max(month-start, inception)
     # =============================
     if label == "MTD":
-        raw_start = as_of.replace(day=1)
-        start = max(raw_start, inception_date)
+        # Last day of prior month
+        prior_month_end = as_of.replace(day=1) - pd.Timedelta(days=1)
 
+        # Find the last PV date on or before prior_month_end
+        pv_idx = pv.index
+        prev_dates = pv_idx[pv_idx <= prior_month_end]
+        if len(prev_dates) == 0:
+            return np.nan
+
+        start = prev_dates.max()
+
+        # Horizon length
         full_horizon_days = (as_of - start).days + 1
         lived_days = (as_of - inception_date).days + 1
 
+        # Must have lived the whole MTD period
         if lived_days < full_horizon_days:
             return np.nan
+
+        # Must have real start < end
         if start >= as_of:
             return np.nan
 
         return compute_period_twr(pv, cf, start, as_of)
+
 
     # =============================
     # YTD: ONLY if portfolio live on Jan 1
@@ -464,19 +484,44 @@ def compute_horizon_twr(
         return compute_period_twr(pv, cf, start, as_of)
   
     # =============================
-    # Other rolling horizons
+    # Calendar 1M (GIPS-compliant)
+    # =============================
+    if label == "1M":
+        one_month_prior = as_of - pd.DateOffset(months=1)
+
+        pv_idx = pv.index
+        idx_pos = pv_idx.searchsorted(one_month_prior)
+        if idx_pos >= len(pv_idx):
+            return np.nan
+
+        start = pv_idx[idx_pos]
+
+        full_horizon_days = (as_of - start).days + 1
+        lived_days = (as_of - inception_date).days + 1
+
+        if lived_days < full_horizon_days:
+            return np.nan
+        if start >= as_of:
+            return np.nan
+
+        return compute_period_twr(pv, cf, start, as_of)
+
+
+    # =============================
+    # Rolling OTHER horizons
     # =============================
     days_map = {
         "1W": 7,
-        "1M": 30,
         "3M": 90,
         "6M": 180,
         "1Y": 365,
         "3Y": 365 * 3,
         "5Y": 365 * 5,
     }
+
     if label not in days_map:
         raise ValueError(f"Unsupported horizon label: {label}")
+
 
     full_horizon_days = days_map[label]
     start = as_of - timedelta(days=full_horizon_days)
@@ -644,11 +689,35 @@ def compute_security_modified_dietz(
                 start = as_of - timedelta(days=7)
                 horizon_days = 7
             elif h == "MTD":
-                start = as_of.replace(day=1)
+                # MTD anchored to EOD of last trading day of the prior month
+                prev_month_end = as_of.replace(day=1) - pd.Timedelta(days=1)
+
+                # Use the last available price date on or before prev_month_end
+                price_idx = price_series.index  # non-NaN prices for this ticker
+                prev_dates = price_idx[price_idx <= prev_month_end]
+                if len(prev_dates) == 0:
+                    row[h] = np.nan
+                    continue
+
+                start = prev_dates.max()
                 horizon_days = (as_of - start).days + 1
+
             elif h == "1M":
-                start = as_of - timedelta(days=30)
-                horizon_days = 30
+                # Calendar 1M (GIPS-style)
+                one_month_prior = as_of - pd.DateOffset(months=1)
+
+                # Use this ticker's own price index
+                price_idx = price_series.index
+                idx_pos = price_idx.searchsorted(one_month_prior)
+
+                if idx_pos >= len(price_idx):
+                    row[h] = np.nan
+                    continue
+
+                start = price_idx[idx_pos]
+                horizon_days = (as_of - start).days + 1
+
+
             elif h == "3M":
                 start = as_of - timedelta(days=90)
                 horizon_days = 90
@@ -753,12 +822,22 @@ def run_engine():
 
 
     # Inception date logic (unchanged)
+    # Determine correct inception = earliest economic activity
+    dates = []
+
     if not cashflows_ext.empty:
-        inception_date = max(pv.index.min(), cashflows_ext["date"].min())
-        cf = cashflows_ext[cashflows_ext["date"] >= pv.index.min()].copy()
-    else:
-        inception_date = pv.index.min()
-        cf = cashflows_ext.copy()
+        dates.append(cashflows_ext["date"].min())
+
+    if not transactions_raw.empty:
+        dates.append(transactions_raw["date"].min())
+
+    dates.append(pv.index.min())
+
+    inception_date = min(dates)
+
+    # External flows only where PV exists
+    cf = cashflows_ext[cashflows_ext["date"] >= pv.index.min()].copy()
+
 
     # ------ PORTFOLIO TWR (same math, but stored instead of printed) ------
     results = {}
@@ -868,7 +947,7 @@ def run_engine():
 
 def main():
     # Run engine (math unchanged)
-    twr_df, sec_table, class_df = run_engine()
+    twr_df, sec_table, class_df, pv = run_engine()
 
     # ---------- PRINT PORTFOLIO TWR ----------
     print("\n========== PORTFOLIO TWR (Time-Weighted Return) ==========\n")
@@ -904,6 +983,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
