@@ -373,28 +373,45 @@ def compute_period_twr(
         # No flows in the window: simple holding-period return
         return pv_window.iloc[-1] / pv_window.iloc[0] - 1.0
 
-    boundaries = [pv_window.index.min()] + cf_window["date"].tolist() + [pv_window.index.max()]
+    # --- FIX: aggregate flows by date to avoid double-counting ---
+    cf_agg = (
+        cf_window.groupby("date", as_index=False)["amount"]
+        .sum()
+        .sort_values("date")
+    )
+
+    boundaries = (
+        [pv_window.index.min()]
+        + cf_agg["date"].tolist()
+        + [pv_window.index.max()]
+    )
+
     sub_returns = []
 
     for i in range(len(boundaries) - 1):
-        start = boundaries[i]
-        end   = boundaries[i + 1]
-
-        start = pv_window.index[pv_window.index.get_indexer([start], method="nearest")[0]]
-        end   = pv_window.index[pv_window.index.get_indexer([end],   method="nearest")[0]]
+        start = pv_window.index[
+            pv_window.index.get_indexer([boundaries[i]], method="nearest")[0]
+        ]
+        end = pv_window.index[
+            pv_window.index.get_indexer([boundaries[i+1]], method="nearest")[0]
+        ]
 
         pv_start = pv_window.loc[start]
         pv_end   = pv_window.loc[end]
 
-        cf_amt = cf_window.iloc[i]["amount"] if i < len(cf_window) else 0.0
-        denom = pv_start + cf_amt
+        # each boundary corresponds to EXACTLY one aggregated flow
+        if i < len(cf_agg):
+            cf_amt = cf_agg.iloc[i]["amount"]
+        else:
+            cf_amt = 0.0
 
+        denom = pv_start + cf_amt
         if denom <= 0:
-            # skip pathological subperiods
             continue
 
         r = (pv_end - denom) / denom
         sub_returns.append(1.0 + r)
+
 
     if not sub_returns:
         return np.nan
@@ -851,7 +868,7 @@ def run_engine():
         .rename(columns={"index": "Horizon", 0: "Return"})
     )
     
-    # ---- SINCE-INCEPTION PORTFOLIO TWR ----
+    # ---- SINCE-INCEPTION PORTFOLIO TWR (flow-adjusted) ----
     twr_since_inception = compute_period_twr(
         pv,
         cf,
@@ -859,10 +876,28 @@ def run_engine():
         pv.index.max()
     )
 
-    # ---- SINCE-INCEPTION PORTFOLIO P/L ----
-    pv_start = pv.iloc[0]
-    pv_end   = pv.iloc[-1]
-    pl_since_inception = pv_end - pv_start
+    # ---- SINCE-INCEPTION PORTFOLIO P/L (ECONOMIC, MATCHES BUILD_REPORT) ----
+    # P/L_SI = MV_end − MV_start − net_external_flows(start, end)
+    as_of = pv.index.max()
+    start = inception_date
+
+    # Map inception_date onto the first PV date on/after it
+    if start not in pv.index:
+        pv_idx = pv.index.sort_values()
+        pos = pv_idx.searchsorted(start)
+        start = pv_idx[pos]
+
+    mv_start = float(pv.loc[start])
+    mv_end   = float(pv.loc[as_of])
+
+    # External flows strictly after start and strictly before end
+    if not cashflows_ext.empty:
+        mask = (cashflows_ext["date"] > start) & (cashflows_ext["date"] < as_of)
+        net_ext = float(cashflows_ext.loc[mask, "amount"].sum())
+    else:
+        net_ext = 0.0
+
+    pl_since_inception = mv_end - mv_start - net_ext
 
 
     # ------ MV + weights (unchanged math) ------
