@@ -709,8 +709,19 @@ def compute_security_modified_dietz(
                 start = prev_idx.max()
                 horizon_days = (as_of - start).days
             elif h == "1W":
-                start = as_of - timedelta(days=7)
-                horizon_days = 7
+                # True 1-week horizon, aligned to *trading days* for this ticker.
+                # Anchor at (as_of - 7 calendar days), then snap to the first
+                # available price date ON or AFTER that.
+                price_idx = price_series.index  # non-NaN prices for this ticker
+                one_week_prior = as_of - pd.Timedelta(days=7)
+
+                idx_pos = price_idx.searchsorted(one_week_prior)
+                if idx_pos >= len(price_idx):
+                    row[h] = np.nan
+                    continue
+
+                start = price_idx[idx_pos]
+                horizon_days = (as_of - start).days + 1
             elif h == "MTD":
                 # MTD anchored to EOD of last trading day of the prior month
                 prev_month_end = as_of.replace(day=1) - pd.Timedelta(days=1)
@@ -776,11 +787,6 @@ def compute_security_modified_dietz(
             #         invalidates full horizon (critical fix)
             # ------------------------------
             effective_start = max(start, earliest_price, first_tx_date)
-
-            # If effective_start > start, then we do NOT have the full horizon
-            if effective_start > start:
-                row[h] = np.nan
-                continue
 
             # ------------------------------
             # Step 4 — Safe MD computation
@@ -1034,6 +1040,28 @@ def run_engine():
                 np.nan,
             )
 
+    # =========================================================
+    # DEBUG: sanity check 1W vs MTD MD returns in sec_table
+    # =========================================================
+    if isinstance(sec_table, pd.DataFrame) and "1W" in sec_table.columns and "MTD" in sec_table.columns:
+        print("\n=== DEBUG: 1W vs MTD MD by ticker (engine) ===")
+        try:
+            tmp = sec_table[["ticker", "1W", "MTD"]].copy()
+        except KeyError:
+            tmp = sec_table.reset_index()[["ticker", "1W", "MTD"]].copy()
+
+        print(tmp.to_string(index=False))
+
+        eq_mask = (pd.to_numeric(tmp["1W"], errors="coerce").round(6)
+                   == pd.to_numeric(tmp["MTD"], errors="coerce").round(6))
+        print("\nAll 1W == MTD?", bool(eq_mask.all()))
+        if not eq_mask.all():
+            print("\nTickers where 1W != MTD:")
+            print(tmp.loc[~eq_mask])
+        else:
+            print("1W column appears identical to MTD (this is your bug).")
+
+
 
     return twr_df, sec_table, class_df, pv, twr_since_inception, twr_since_inception_annualized, pl_since_inception
 
@@ -1044,7 +1072,7 @@ def run_engine():
 
 def main():
     # Run engine (math unchanged)
-    twr_df, sec_table, class_df, pv, twr_since_inception, pl_since_inception = run_engine()
+    twr_df, sec_table, class_df, pv, twr_since_inception, twr_since_inception_annualized, pl_since_inception = run_engine()
 
     # ---------- PRINT PORTFOLIO TWR ----------
     print("\n========== PORTFOLIO TWR (Time-Weighted Return) ==========\n")
