@@ -28,6 +28,7 @@ def fmt_pct_clean(x):
             return "N/A"
         return f"{float(x)*100:.2f}%"
     except:
+
         return "N/A"
 
 def fmt_dollar_clean(x):
@@ -305,8 +306,17 @@ def build_report():
         if start is None or start >= as_of:
             return "N/A"
 
+        # ----- Map horizon start onto actual PV index -----
+        if start not in pv.index:
+            pv_idx = pv.index.sort_values()
+            pos = pv_idx.searchsorted(start)
+            if pos >= len(pv_idx):
+                return "N/A"
+            start = pv_idx[pos]
+
         mv_start = float(pv.loc[start])
-        mv_end = float(pv.loc[as_of])
+        mv_end   = float(pv.loc[as_of])
+
 
         # flows strictly inside (start, as_of)
         net_flows = 0.0
@@ -327,8 +337,17 @@ def build_report():
         as_of = pv.index.max()
         start = inception_date
 
+        # Map inception_date onto nearest PV trading day
+        if start not in pv.index:
+            pv_idx = pv.index.sort_values()
+            pos = pv_idx.searchsorted(start)
+            if pos >= len(pv_idx):
+                return "N/A"
+            start = pv_idx[pos]
+
         mv_start = float(pv.loc[start])
-        mv_end = float(pv.loc[as_of])
+        mv_end   = float(pv.loc[as_of])
+
 
         # external flows strictly AFTER inception (not including day 1 capital)
         net_flows = 0.0
@@ -467,6 +486,12 @@ def build_report():
         raw_start = get_horizon_start(h)
         if raw_start is None or raw_start >= as_of:
             return "N/A"
+            
+        # Clamp start to the earliest price date for this ticker
+        earliest_px = series.index.min()
+        if raw_start < earliest_px:
+            raw_start = earliest_px
+
 
         # Map portfolio horizon start onto this ticker's price series
         series_dates = series.index.sort_values()
@@ -1940,7 +1965,7 @@ def build_report():
     # Daily ΔPV
     dpv = pv_daily.diff().fillna(0.0)
 
-    # External flows per day
+    # ---------------- EXTERNAL FLOWS ----------------
     cf_all = load_cashflows_external().copy()
     if not cf_all.empty:
         cf_all = cf_all.sort_values("date")
@@ -1952,8 +1977,23 @@ def build_report():
     else:
         ext_series = pd.Series(0.0, index=pv_daily.index)
 
-    # Market component:
-    mkt_series = dpv - ext_series
+    # ---------------- INTERNAL FLOWS (Buys/Sells) ----------------
+    tx_all = load_transactions_raw().copy()
+    if not tx_all.empty:
+        tx_all = tx_all.sort_values("date")
+        internal_series = (
+            tx_all.groupby("date")["amount"]
+            .sum()
+            .reindex(pv_daily.index, fill_value=0.0)
+        )
+    else:
+        internal_series = pd.Series(0.0, index=pv_daily.index)
+        
+
+    # ---------------- MARKET EFFECT ----------------
+    # Residual after removing BOTH external + internal flows
+    mkt_series = dpv - ext_series - internal_series
+
 
     # Last 30 days window
     window_days = 30
@@ -1964,30 +2004,43 @@ def build_report():
     dates_win = pv_daily.index[mask]
     dpv_win = dpv[mask]
     ext_win = ext_series[mask]
+    internal_win = internal_series[mask]
     mkt_win = mkt_series[mask]
 
     # Cumulative ΔPV (rebased to 0)
-    cum_total = (ext_series + mkt_series).cumsum()
+    cum_total = (ext_series + internal_series + mkt_series).cumsum()
     cum_win = cum_total[mask] - cum_total[mask].iloc[0]
 
     import matplotlib.dates as mdates
 
     fig, ax1 = plt.subplots(figsize=(9, 4.5))
 
-    # -------------------- STACKED BARS --------------------
+    # External flows layer
     ax1.bar(
         dates_win,
         ext_win,
         label="External Flows",
         width=0.9,
     )
+
+    # Internal flows layer (stacked on external)
+    ax1.bar(
+        dates_win,
+        internal_win,
+        bottom=ext_win,
+        label="Internal Flows",
+        width=0.9,
+    )
+
+    # Market effects layer (stacked on external + internal)
     ax1.bar(
         dates_win,
         mkt_win,
-        bottom=ext_win,
-        label="Market Move",
+        bottom=ext_win + internal_win,
+        label="Market Effects",
         width=0.9,
     )
+
 
     ax1.set_ylabel("Δ Portfolio Value ($)")
     ax1.set_title("Daily ΔPV Attribution (External vs Market)")
