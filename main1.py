@@ -31,6 +31,12 @@ PRICE_LOOKBACK_YEARS = 6
 
 HORIZONS = ["1D", "1W", "MTD", "1M", "3M", "6M", "YTD", "1Y", "3Y", "5Y"]
 
+# Multi-year horizons to annualize when presenting results
+ANNUALIZE_HORIZONS = {
+    "3Y": 3,
+    "5Y": 5,
+}
+
 # ------------------------------------------------------------
 # Load holdings (your schema)
 # ------------------------------------------------------------
@@ -869,12 +875,22 @@ def run_engine():
     )
     
     # ---- SINCE-INCEPTION PORTFOLIO TWR (flow-adjusted) ----
+    as_of = pv.index.max()
     twr_since_inception = compute_period_twr(
         pv,
         cf,
         inception_date,
-        pv.index.max()
+        as_of
     )
+
+    # ---- ANNUALIZED SINCE-INCEPTION TWR (if > 1 year) ----
+    days_since_inception = (as_of - inception_date).days
+    if pd.notna(twr_since_inception) and days_since_inception > 365:
+        years_since_inception = days_since_inception / 365.0
+        twr_since_inception_annualized = (1.0 + twr_since_inception) ** (1.0 / years_since_inception) - 1.0
+    else:
+        twr_since_inception_annualized = np.nan
+
 
     # ---- SINCE-INCEPTION PORTFOLIO P/L (ECONOMIC, MATCHES BUILD_REPORT) ----
     # P/L_SI = MV_end − MV_start − net_external_flows(start, end)
@@ -934,7 +950,7 @@ def run_engine():
     if sec_md_df.empty:
         sec_table = pd.DataFrame()
         class_df = pd.DataFrame()
-        return twr_df, sec_table, class_df, pv, twr_since_inception, pl_since_inception
+        return twr_df, sec_table, class_df, pv, twr_since_inception, twr_since_inception_annualized, pl_since_inception
 
     # Build SEC TABLE (same ordering, same logic)
     cols_to_show = (
@@ -987,7 +1003,39 @@ def run_engine():
     class_df = class_df.sort_values("class_market_value", ascending=False)
     class_df = class_df[["asset_class"] + HORIZONS]
 
-    return twr_df, sec_table, class_df, pv, twr_since_inception, pl_since_inception
+    # ------ Annualize multi-year horizons (3Y, 5Y) for reporting ------
+
+    for label, years in ANNUALIZE_HORIZONS.items():
+        # Portfolio TWR (twr_df is long-form)
+        mask = twr_df["Horizon"] == label
+        if mask.any():
+            vals = twr_df.loc[mask, "Return"]
+            twr_df.loc[mask, "Return"] = np.where(
+                vals.notna(),
+                (1.0 + vals) ** (1.0 / years) - 1.0,
+                np.nan,
+            )
+
+        # Security-level MD table (wide form)
+        if not sec_table.empty and label in sec_table.columns:
+            vals = sec_table[label]
+            sec_table[label] = np.where(
+                vals.notna(),
+                (1.0 + vals) ** (1.0 / years) - 1.0,
+                np.nan,
+            )
+
+        # Asset-class MD table (wide form)
+        if not class_df.empty and label in class_df.columns:
+            vals = class_df[label]
+            class_df[label] = np.where(
+                vals.notna(),
+                (1.0 + vals) ** (1.0 / years) - 1.0,
+                np.nan,
+            )
+
+
+    return twr_df, sec_table, class_df, pv, twr_since_inception, twr_since_inception_annualized, pl_since_inception
 
 
 # ------------------------------------------------------------
