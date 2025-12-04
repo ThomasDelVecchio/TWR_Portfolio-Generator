@@ -100,7 +100,7 @@ def add_table(doc, headers, rows, right_align=None):
 def build_report():
 
     # Run the engine (unchanged math)
-    twr_df, sec_full, class_full, pv, twr_si, pl_si = run_engine()
+    twr_df, sec_full, class_full, pv, twr_si, twr_si_annualized, pl_si = run_engine()
 
     cf_ext = load_cashflows_external()
 
@@ -388,14 +388,19 @@ def build_report():
         
     # ===== ADD SINCE-INCEPTION ROW =====
     si_pl = pl_si
-    si_ret = twr_si
 
+    # Prefer annualized SI if run_engine computed it (i.e., inception > ~1 year).
+    if twr_si_annualized is not None and not pd.isna(twr_si_annualized):
+        si_ret_for_display = twr_si_annualized
+    else:
+        si_ret_for_display = twr_si
 
     rows.append([
         "Since Inception",
-        fmt_pct_clean(si_ret),
+        fmt_pct_clean(si_ret_for_display),
         fmt_dollar_clean(si_pl)
     ])
+
 
 
     add_table(
