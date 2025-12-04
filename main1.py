@@ -850,6 +850,20 @@ def run_engine():
         .T.reset_index()
         .rename(columns={"index": "Horizon", 0: "Return"})
     )
+    
+    # ---- SINCE-INCEPTION PORTFOLIO TWR ----
+    twr_since_inception = compute_period_twr(
+        pv,
+        cf,
+        inception_date,
+        pv.index.max()
+    )
+
+    # ---- SINCE-INCEPTION PORTFOLIO P/L ----
+    pv_start = pv.iloc[0]
+    pv_end   = pv.iloc[-1]
+    pl_since_inception = pv_end - pv_start
+
 
     # ------ MV + weights (unchanged math) ------
     latest_prices = prices.iloc[-1]
@@ -885,7 +899,7 @@ def run_engine():
     if sec_md_df.empty:
         sec_table = pd.DataFrame()
         class_df = pd.DataFrame()
-        return twr_df, sec_table, class_df, pv
+        return twr_df, sec_table, class_df, pv, twr_since_inception, pl_since_inception
 
     # Build SEC TABLE (same ordering, same logic)
     cols_to_show = (
@@ -938,7 +952,7 @@ def run_engine():
     class_df = class_df.sort_values("class_market_value", ascending=False)
     class_df = class_df[["asset_class"] + HORIZONS]
 
-    return twr_df, sec_table, class_df, pv
+    return twr_df, sec_table, class_df, pv, twr_since_inception, pl_since_inception
 
 
 # ------------------------------------------------------------
@@ -947,7 +961,7 @@ def run_engine():
 
 def main():
     # Run engine (math unchanged)
-    twr_df, sec_table, class_df, pv = run_engine()
+    twr_df, sec_table, class_df, pv, twr_since_inception, pl_since_inception = run_engine()
 
     # ---------- PRINT PORTFOLIO TWR ----------
     print("\n========== PORTFOLIO TWR (Time-Weighted Return) ==========\n")
