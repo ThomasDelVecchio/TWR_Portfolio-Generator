@@ -49,6 +49,8 @@ def add_table(doc, headers, rows, right_align=None):
 
     table = doc.add_table(rows=1, cols=len(headers))
     table.style = "Light Grid Accent 1"
+    table.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
 
     # ----- FORCE TABLE TO FIT PAGE WIDTH -----
     table.autofit = True
@@ -97,13 +99,12 @@ def add_table(doc, headers, rows, right_align=None):
 def build_report():
 
     # Run the engine (unchanged math)
-    twr_df, sec_full, class_full, pv = run_engine()
+    twr_df, sec_full, class_full, pv, twr_si, pl_si = run_engine()
 
     cf_ext = load_cashflows_external()
 
     tx_raw = load_transactions_raw()
 
-    twr_df_raw, _, _, pv_raw = run_engine()
     
     # === Inception date (same logic as run_engine) ===
     dates = []
@@ -316,6 +317,47 @@ def build_report():
         pl = mv_end - mv_start - net_flows
         return fmt_dollar_clean(pl)
 
+    # =============================================================
+    # SINCE INCEPTION — PORTFOLIO RETURN & P/L
+    # Uses SAME PV series, SAME inception_date, SAME external-flow logic.
+    # =============================================================
+
+    def compute_since_inception_pl():
+        """Economic P/L since inception."""
+        as_of = pv.index.max()
+        start = inception_date
+
+        mv_start = float(pv.loc[start])
+        mv_end = float(pv.loc[as_of])
+
+        # external flows strictly AFTER inception (not including day 1 capital)
+        net_flows = 0.0
+        if cf_ext is not None and not cf_ext.empty:
+            mask = (cf_ext["date"] > start) & (cf_ext["date"] < as_of)
+            net_flows = float(cf_ext.loc[mask, "amount"].sum())
+
+        pl = mv_end - mv_start - net_flows
+        return pl
+
+
+    def compute_since_inception_return():
+        """Time-weighted return from inception to today."""
+        # cumulative TWR = product of all daily returns - 1
+        as_of = pv.index.max()
+
+        cf_ext_local = load_cashflows_external().copy()
+        pv_dates = pv.index
+
+        running = 1.0
+        for i in range(1, len(pv_dates)):
+            d0 = pv_dates[i-1]
+            d1 = pv_dates[i]
+
+            flow = cf_ext_local.loc[cf_ext_local["date"] == d1, "amount"].sum()
+            R = (pv.loc[d1] - pv.loc[d0] - flow) / pv.loc[d0]
+            running *= (1 + R)
+
+        return running - 1
 
 
     # Build vertical snapshot rows
@@ -324,6 +366,18 @@ def build_report():
         ret = snap_map.get(h, "N/A")
         pl = compute_horizon_pl(h) if ret != "N/A" else "N/A"
         rows.append([h, ret, pl])
+        
+    # ===== ADD SINCE-INCEPTION ROW =====
+    si_pl = pl_si
+    si_ret = twr_si
+
+
+    rows.append([
+        "Since Inception",
+        fmt_pct_clean(si_ret),
+        fmt_dollar_clean(si_pl)
+    ])
+
 
     add_table(
         doc,
@@ -340,7 +394,7 @@ def build_report():
     num_holdings = len(sec_full)
 
     summary_rows = [
-        ["Total Value", fmt_dollar_clean(total_value)],
+        ["Total Value", fmt_dollar_clean(pv.iloc[-1])],
         ["Target Portfolio Value", fmt_dollar_clean(TARGET_PORTFOLIO_VALUE)],
         ["Number of Holdings", num_holdings],
     ]
@@ -466,10 +520,7 @@ def build_report():
             return "N/A"
 
         start = max(start, first_trade)
-        # MD CONSISTENCY GUARD:
-        # If effective start is later than the benchmark portfolio horizon anchor → N/A
-        if start > raw_start:
-            return "N/A"
+
         # ----- Prices -----
         try:
             px_start = float(series.loc[start])
@@ -1099,75 +1150,21 @@ def build_report():
     run.add_picture(img_stream, width=Inches(6))
     paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
-    # ---------------------------------------------------------------
-    # SECTOR ALLOCATION HEATMAP
-    # ---------------------------------------------------------------
-
-    # Hardcode ETF sector map from config
-    sector_exposure = defaultdict(float)
-
-    # Sector normalization to avoid duplicates
-    SECTOR_NORMALIZATION = {
-        "Comm Services": "Communication Services",
-        "Consumer Disc.": "Consumer Discretionary",
-        "Information Technology": "Tech",
-        "Other": None,  # ignore "Other" buckets
-    }
-
-    # Use raw market values and exclude CASH from the denominator so that
-    # sector weights are based on invested assets only.
-    sector_universe = sec_only[sec_only["ticker"].isin(ETF_SECTOR_MAP.keys())].copy()
-    sector_universe = sector_universe[sector_universe["value"] > 0]
-
-    total_invested = sector_universe["value"].sum()
-
-    if total_invested > 0:
-        for _, row in sector_universe.iterrows():
-            ticker = row["ticker"]
-            # weight of this holding as % of invested (non-CASH) assets
-            weight_pct = (row["value"] / total_invested) * 100.0
-
-            etf_sectors = ETF_SECTOR_MAP.get(ticker, {})
-            for sector, pct in etf_sectors.items():
-                norm_sector = SECTOR_NORMALIZATION.get(sector, sector)
-                if norm_sector is None:
-                    continue
-                sector_exposure[norm_sector] += weight_pct * pct / 100.0
-
-
-    # Convert to sorted DataFrame
-    sector_df = pd.DataFrame(
-        list(sector_exposure.items()),
-        columns=["Sector", "Exposure"]
-    ).sort_values("Exposure", ascending=True)
-
-    fig, ax = plt.subplots(figsize=(10, 6))
-    ax.barh(sector_df["Sector"], sector_df["Exposure"], color="skyblue")
-    for i, v in enumerate(sector_df["Exposure"]):
-        ax.text(v + 0.3, i, f"{v:.1f}%", va="center", fontsize=9)
-
-    ax.set_xlabel("Portfolio Exposure (%)")
-    ax.set_title("Sector Allocation Heatmap")
-    plt.tight_layout()
-
-    img_stream = BytesIO()
-    plt.savefig(img_stream, format="png", bbox_inches="tight", dpi=150)
-    plt.close(fig)
-    img_stream.seek(0)
-
-    doc.add_heading("Sector Allocation Heatmap", level=1)
-    paragraph = doc.add_paragraph()
-    run = paragraph.add_run()
-    run.add_picture(img_stream, width=Inches(6))
-    paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    doc.add_paragraph("Figure: Approximate sector exposure for portfolio ETFs.", style="Normal").alignment = WD_ALIGN_PARAGRAPH.CENTER
 
     # ---------------------------------------------------------------
     # PORTFOLIO VS BENCHMARKS — MTD & YTD (PRICE RETURN)
     # ---------------------------------------------------------------
 
-    portfolio_value = pv.copy()
-    portfolio_value.index = pd.to_datetime(portfolio_value.index)
+    # Keep ORIGINAL pv for horizon logic (TWR + MD + snapshot consistency)
+    pv_trading = pv.sort_index()
+
+    # Build a DAILY PV series for CHARTS ONLY
+    pv_daily = pv_trading.reindex(
+        pd.date_range(pv_trading.index.min(), pv_trading.index.max(), freq="D")
+    ).ffill()
+
+    portfolio_value = pv_daily.copy()
+
 
 
     # Current "as of" date
@@ -1225,7 +1222,7 @@ def build_report():
     # ---------------- MTD TWR-BASED CHART ----------------
     doc.add_page_break()
     doc.add_heading("Time-Series Performance Charts", level=1)
-    doc.add_heading("MTD Cumulative Return — Portfolio vs Benchmarks (TWR-Based)", level=2)
+    doc.add_heading("MTD Cumulative Return — Portfolio vs Benchmarks", level=2)
 
     # 1) Portfolio TWR cumulative curve (based on pv)
     mtd_start_twr = twr_anchor
@@ -1292,7 +1289,7 @@ def build_report():
         ax.plot(series.index, series.values, label=name, linewidth=1.6)
 
     ax.set_ylabel("Cumulative Return (%)")
-    ax.set_title("MTD Cumulative Return — Portfolio vs Benchmarks (TWR-Based)")
+    ax.set_title("MTD Cumulative Return — Portfolio vs Benchmarks")
     ax.legend(fontsize=8)
     plt.tight_layout()
 
@@ -1308,43 +1305,14 @@ def build_report():
     paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
     doc.add_paragraph(
-        "Footnote: Portfolio returns use true GIPS-compliant TWR based on a flow-adjusted, end-of-day PV series (external flows treated at start-of-day). Benchmark returns use simple price return and are rebased to the same start date for comparability.",
+        "Figure: Portfolio returns use true TWR based on a flow-adjusted, end-of-day PV series (external flows treated at start-of-day). Benchmark returns use simple price return and are rebased to the same start date for comparability.",
         style="Normal"
     ).alignment = WD_ALIGN_PARAGRAPH.CENTER
-
-
-    # ---------------- YTD CHART (update to twr starting new year)----------------
-    fig, ax = plt.subplots(figsize=(10, 5))
-    ax.plot(portfolio_ytd.index, portfolio_ytd.values, label="Portfolio (Price Return)", linewidth=2)
-    for name, ret in benchmark_returns.items():
-        ax.plot(ret["YTD"].index, ret["YTD"].values, label=name)
-    ax.set_ylabel("Cumulative Return (%)")
-    ax.set_title("YTD Cumulative Return — Portfolio vs Benchmarks")
-    ax.legend(fontsize=8)
-    import matplotlib.dates as mdates
-    ax.xaxis.set_major_locator(mdates.WeekdayLocator(interval=1))
-    plt.setp(ax.get_xticklabels(), rotation=45, ha='right')
-
-    plt.tight_layout()
-
-    img_stream = BytesIO()
-    plt.savefig(img_stream, format="png", dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    img_stream.seek(0)
-
-    doc.add_heading("YTD Cumulative Return — Portfolio vs Benchmarks", level=2)
-    paragraph = doc.add_paragraph()
-    run = paragraph.add_run()
-    run.add_picture(img_stream, width=Inches(6))
-    paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    doc.add_paragraph("Footnote: Price return only, not TWR.", style="Normal").alignment = WD_ALIGN_PARAGRAPH.CENTER
-
-    doc.add_page_break()
-
+    
     # ---------------------------------------------------------------
     # PERFORMANCE VS BENCHMARKS (MTD ONLY — TWR CONSISTENT)
     # ---------------------------------------------------------------
-    doc.add_heading("Performance vs Benchmarks (MTD Only)", level=1)
+    doc.add_heading("Performance vs Benchmarks (MTD Only)", level=2)
 
     # --- 1) Portfolio MTD TWR ---
     # twr_df stores MTD under Horizon == "MTD"
@@ -1426,128 +1394,334 @@ def build_report():
         "Note: Portfolio MTD uses true TWR; benchmarks use price returns rebased to the same start date."
     )
 
-    # ---------------------------------------------------------------
-    # PERFORMANCE VS BENCHMARKS (YTD — TWR CONSISTENT)
-    # ---------------------------------------------------------------
-    doc.add_heading("Performance vs Benchmarks (YTD — TWR Consistent)", level=1)
+    doc.add_page_break()
+    
+    # ---------------- SINCE INCEPTION CHART (TWR vs Benchmarks) ----------------
+    fig, ax = plt.subplots(figsize=(10, 5))
 
-    # 1) Portfolio YTD TWR (flow-adjusted)
-    portfolio_ytd_row = twr_df[twr_df["Horizon"] == "YTD"]
-    if not portfolio_ytd_row.empty:
-        portfolio_ytd_val = portfolio_ytd_row["Return"].iloc[0]
-    else:
-        portfolio_ytd_val = "N/A"
+    import matplotlib.dates as mdates
 
-    # 2) Benchmark YTD price returns (rebased to Jan 1)
-    benchmarks_ytd = {
-        "S&P 500": "^GSPC",
-        "Global 60/40": "AOR",
-        "Conservative 40/60": "AOK"
+    # Dynamic locator but limited tick count
+    locator = mdates.AutoDateLocator(minticks=6, maxticks=6)
+    ax.xaxis.set_major_locator(locator)
+
+    # Force full date format
+    ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
+
+
+
+    # Portfolio since-inception TWR curve (twr_curve is already cumulative)
+    twr_si_curve = twr_curve.copy()
+    si_start = twr_si_curve.index.min()
+    twr_si_pct = (twr_si_curve / twr_si_curve.iloc[0] - 1.0) * 100.0
+
+    ax.plot(
+        twr_si_pct.index,
+        twr_si_pct.values,
+        label="Portfolio (TWR Since Inception)",
+        linewidth=2,
+    )
+
+    # Benchmarks since inception — price return rebased to si_start
+    benchmark_map = {
+        "S&P 500 (^GSPC)": "^GSPC",
+        "AOR (Global 60/40)": "AOR",
+        "AOK (Conservative 40/60)": "AOK",
     }
 
-    as_of = pv.index.max()
-    ytd_start = get_horizon_start("YTD")
-    if ytd_start is None:
-        ytd_start = pv.index.min()
+    benchmark_curves_si = {}
 
-
-    bench_rows_ytd = []
-
-    for name, ticker in benchmarks_ytd.items():
+    for name, ticker in benchmark_map.items():
         try:
             hist = fetch_price_history([ticker])
-            series = hist[ticker]
+            hist.index = pd.to_datetime(hist.index)
+            ser = hist[ticker].dropna()
 
-            series = series[series.index >= ytd_start]
+            # Align to portfolio SI start
+            ser = ser[ser.index >= si_start]
+
+            if len(ser) > 1:
+                ser_norm = (ser / ser.iloc[0] - 1.0) * 100.0
+                benchmark_curves_si[name] = ser_norm
+        except Exception:
+            continue
+
+    for name, series in benchmark_curves_si.items():
+        ax.plot(series.index, series.values, label=name, linewidth=1.6)
+
+    ax.set_ylabel("Cumulative Return (%)")
+    ax.set_title("Since Inception Cumulative Return — Portfolio vs Benchmarks")
+    ax.legend(fontsize=8)
+    plt.tight_layout()
+    fig.autofmt_xdate()
+    img_stream = BytesIO()
+    plt.savefig(img_stream, format="png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    img_stream.seek(0)
+
+    doc.add_heading("Since Inception Cumulative Return — Portfolio vs Benchmarks", level=2)
+    paragraph = doc.add_paragraph()
+    run = paragraph.add_run()
+    run.add_picture(img_stream, width=Inches(6))
+    paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    doc.add_paragraph(
+        "Figure: Portfolio curve uses true since-inception TWR based on the flow-adjusted PV series. "
+        "Benchmarks use simple price returns rebased to the same since-inception start date.",
+        style="Normal"
+    ).alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    # ---------------------------------------------------------------
+    # PERFORMANCE VS BENCHMARKS (SINCE INCEPTION — TWR Consistent)
+    # ---------------------------------------------------------------
+    doc.add_heading("Performance vs Benchmarks (Since Inception Only)", level=2)
+
+    # 1) Portfolio since-inception TWR (flow-adjusted)
+    # twr_si is a decimal (e.g., 0.1234); fmt_pct_clean turns it into "12.34%"
+    portfolio_si_val = fmt_pct_clean(twr_si)
+
+    # 2) Benchmark since-inception price returns
+    benchmarks_si = {
+        "S&P 500": "^GSPC",
+        "Global 60/40": "AOR",
+        "Conservative 40/60": "AOK",
+    }
+
+    # Use the same anchor as the SI chart: first date in twr_curve
+    si_start = twr_curve.index.min()
+
+    bench_rows_si = []
+
+    for name, ticker in benchmarks_si.items():
+        try:
+            hist = fetch_price_history([ticker])
+            series = hist[ticker].dropna()
+
+            # Align to since-inception anchor
+            series = series[series.index >= si_start]
 
             if len(series) > 1:
-                bench_ytd = (series.iloc[-1] / series.iloc[0] - 1.0) * 100.0
-                bench_ytd_fmt = f"{bench_ytd:.2f}%"
+                bench_si = (series.iloc[-1] / series.iloc[0] - 1.0) * 100.0
+                bench_si_fmt = f"{bench_si:.2f}%"
 
-                if portfolio_ytd_val not in ("N/A", None):
-                    port_float = float(str(portfolio_ytd_val).replace("%", ""))
-                    excess = port_float - bench_ytd
+                if portfolio_si_val not in ("N/A", None):
+                    port_float = float(str(portfolio_si_val).replace("%", ""))
+                    excess = port_float - bench_si
                     excess_fmt = f"{excess:.2f}%"
                 else:
                     excess_fmt = "N/A"
             else:
-                bench_ytd_fmt = "N/A"
+                bench_si_fmt = "N/A"
                 excess_fmt = "N/A"
 
         except Exception:
-            bench_ytd_fmt = "N/A"
+            bench_si_fmt = "N/A"
             excess_fmt = "N/A"
 
-        bench_rows_ytd.append([
+        bench_rows_si.append([
             name,
-            portfolio_ytd_val,
-            bench_ytd_fmt,
-            excess_fmt
+            portfolio_si_val,
+            bench_si_fmt,
+            excess_fmt,
         ])
 
     add_table(
         doc,
-        ["Benchmark", "Portfolio YTD %", "Benchmark YTD %", "Excess YTD %"],
-        bench_rows_ytd,
+        ["Benchmark", "Portfolio SI %", "Benchmark SI %", "Excess SI %"],
+        bench_rows_si,
         right_align=[1, 2, 3]
     )
 
-    doc.add_paragraph(
-        "Note: Portfolio YTD uses true flow-adjusted TWR; benchmarks use price returns rebased to Jan 1."
-    )
+    doc.add_page_break()
 
 
     # =============================================================
-    # SECURITY-LEVEL (TICKER) RETURNS — CUSTOM COLUMNS
+    # MULTI-HORIZON RETURNS BY ASSET CLASS & TICKER (MODIFIED DIETZ)
     # =============================================================
+    doc.add_heading("Horizon Performance Tables", level=1)
 
-    hdr = doc.add_heading("Holdings Multi-Horizon Returns (Modified Dietz)", level=1)
-   
-    if sec_full.empty:
+    doc.add_heading("Returns Grouped by Asset Class (Modified Dietz)", level=2)
+
+    horizon_cols = ["1D", "1W", "MTD", "1M", "3M", "6M", "YTD", "1Y"]
+
+    if class_full.empty and sec_full.empty:
         doc.add_paragraph("No security-level cashflow data available.")
     else:
-        # exact columns you requested:
-        final_cols = ["ticker","1D","1W","MTD","1M","3M","6M","YTD","1Y"]
+        # Make a formatted view of class_full so we don't double-multiply anything
+        class_view = class_full.copy()
+        for col in horizon_cols:
+            if col in class_view.columns:
+                class_view[col] = class_view[col].apply(fmt_pct_clean)
 
-        # build rows
+        # Order asset classes based on class_full
+        asset_classes = (
+            class_view["asset_class"]
+            .dropna()
+            .drop_duplicates()
+            .tolist()
+        )
+
         rows = []
-        for _, r in sec_full.iterrows():
-            row = []
-            for c in final_cols:
-                row.append(safe(r.get(c)))
-            rows.append(row)
+
+        for ac in asset_classes:
+            # ----- Asset class row -----
+            class_row = class_view[class_view["asset_class"] == ac]
+            if not class_row.empty:
+                r = class_row.iloc[0]
+                row_vals = [asset_class_map.get(ac, ac)]
+                for h in horizon_cols:
+                    row_vals.append(safe(r.get(h)))
+                rows.append(row_vals)
+
+            # ----- Ticker rows under that class -----
+            tickers_in_ac = (
+                sec_full[sec_full["asset_class"] == ac]
+                .sort_values("ticker")["ticker"]
+                .tolist()
+            )
+
+            for t in tickers_in_ac:
+                tr = sec_full[sec_full["ticker"] == t].iloc[0]
+                t_vals = [f"  {t}"]
+                for h in horizon_cols:
+                    t_vals.append(safe(tr.get(h)))
+                rows.append(t_vals)
 
         add_table(
             doc,
-            ["Ticker", "1D", "1W", "MTD", "1M", "3M", "6M", "YTD", "1Y"],
+            ["Asset Class / Ticker"] + horizon_cols,
             rows,
-            right_align=[1,2,3,4,5,6,7,8]
+            right_align=list(range(1, 1 + len(horizon_cols)))
+        )
+        
+        # ---- FIX WIDTHS ONLY FOR THIS HORIZON RETURNS TABLE ----
+        table = doc.tables[-1]  # get last added table
+        table.autofit = False
+        table.allow_autofit = False
+
+        col_widths = [
+            Inches(1.4),  # Asset Class / Ticker
+            Inches(0.8), Inches(0.8), Inches(0.8), Inches(0.8),
+            Inches(0.8), Inches(0.8), Inches(0.8), Inches(0.8)
+        ]
+
+        for i, w in enumerate(col_widths):
+            for row in table.rows:
+                row.cells[i].width = w
+
+
+        doc.add_paragraph(
+            "Returns above are computed using a per-holding and per-asset-class Modified Dietz methodology for each horizon.",
+            style="Normal"
         )
 
     # =============================================================
-    # SECURITY-LEVEL HORIZON P/L TABLE (ECONOMIC, CONSISTENT WITH PORTFOLIO P/L)
+    # MULTI-HORIZON P/L BY ASSET CLASS & TICKER (ECONOMIC, MD-CONSISTENT)
     # =============================================================
-    doc.add_heading("Holdings — Multi-Horizon P/L ($)", level=1)
 
+    doc.add_heading("P/L Grouped by Asset Class", level=2)
 
-    # Build rows
-    ticker_pl_rows = []
     horizons_pl = ["1D", "1W", "MTD", "1M", "3M", "6M", "YTD", "1Y"]
 
-    for _, r in sec_only.iterrows():
-        t = r["ticker"]
-        row_vals = [t]
-        for h in horizons_pl:
-            row_vals.append(compute_ticker_pl(t, h))
-        ticker_pl_rows.append(row_vals)
+    if class_full.empty and sec_full.empty:
+        doc.add_paragraph("No security-level cashflow data available.")
+    else:
 
-    # Add table
-    add_table(
-        doc,
-        ["Ticker", "1D", "1W", "MTD", "1M", "3M", "6M", "YTD", "1Y"],
-        ticker_pl_rows,
-        right_align=list(range(1, 9))
-    )
+        def compute_asset_class_pl(asset_class: str, h: str):
+            """
+            Economic P/L for an asset class over horizon h.
+
+            Computed as the sum of ticker-level economic P/L for all tickers
+            in that asset class, where each ticker P/L is already horizon-
+            aligned to the same get_horizon_start() logic.
+
+            This is additive and therefore fully consistent with the ticker-
+            level Modified Dietz construction.
+            """
+            # Use sec_only for the universe of tickers and asset_class mapping
+            tickers_in_ac = (
+                sec_only[sec_only["asset_class"] == asset_class]["ticker"]
+                .dropna()
+                .unique()
+            )
+
+            total_pl = 0.0
+            seen_any = False
+
+            for t in tickers_in_ac:
+                pl_str = compute_ticker_pl(t, h)
+                if pl_str in (None, "N/A"):
+                    continue
+                try:
+                    # parse formatted "$x,xxx.xx" back to float
+                    val = float(pl_str.replace("$", "").replace(",", ""))
+                except Exception:
+                    continue
+                total_pl += val
+                seen_any = True
+
+            if not seen_any:
+                return "N/A"
+            return fmt_dollar_clean(total_pl)
+
+        rows_pl = []
+
+        # Use the same asset class ordering as the returns table
+        asset_classes_pl = (
+            class_full["asset_class"]
+            .dropna()
+            .drop_duplicates()
+            .tolist()
+        )
+
+        for ac in asset_classes_pl:
+            # ----- Asset class row -----
+            row_vals = [asset_class_map.get(ac, ac)]
+            for h in horizons_pl:
+                row_vals.append(compute_asset_class_pl(ac, h))
+            rows_pl.append(row_vals)
+
+            # ----- Ticker rows under that class -----
+            tickers_in_ac = (
+                sec_only[sec_only["asset_class"] == ac]
+                .sort_values("ticker")["ticker"]
+                .tolist()
+            )
+
+            for t in tickers_in_ac:
+                t_vals = [f"  {t}"]
+                for h in horizons_pl:
+                    t_vals.append(compute_ticker_pl(t, h))
+                rows_pl.append(t_vals)
+
+        add_table(
+            doc,
+            ["Asset Class / Ticker"] + horizons_pl,
+            rows_pl,
+            right_align=list(range(1, 1 + len(horizons_pl)))
+        )
+        
+        # ---- FIX WIDTHS ONLY FOR THIS HORIZON P/L TABLE ----
+        table = doc.tables[-1]  # get last added table
+        table.autofit = False
+        table.allow_autofit = False
+
+        col_widths = [
+            Inches(1.4),  # Asset Class / Ticker
+            Inches(0.8), Inches(0.8), Inches(0.8), Inches(0.8),
+            Inches(0.8), Inches(0.8), Inches(0.8), Inches(0.8)
+        ]
+
+        for i, w in enumerate(col_widths):
+            for row in table.rows:
+                row.cells[i].width = w
+
+
+        doc.add_paragraph(
+            "P/L above is economic P/L by horizon (MV_end − MV_start − net internal flows), "
+            "rolled up additively from tickers to asset classes using the same horizon definitions as the Modified Dietz returns.",
+            style="Normal"
+        )
+
 
     # ---------------------------------------------------------------
     # DETAILED CASH FLOW REPORT (Since Inception)
@@ -1633,7 +1807,7 @@ def build_report():
     # ---------------------------------------------------------------
     # INTERNAL TRADING FLOWS — STACKED BY ASSET CLASS (SINCE INCEPTION)
     # ---------------------------------------------------------------
-    doc.add_heading("Internal Trading Flows by Asset Class (Since Inception)", level=1)
+    doc.add_heading("Internal Trading Flows by Asset Class (Since Inception)", level=2)
 
     tx_raw = load_transactions_raw().copy()
 
@@ -1707,6 +1881,189 @@ def build_report():
         run.add_picture(buf, width=Inches(6))
         paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
+    # ---------------------------------------------------------------
+    # PV MOUNTAIN CHART (Normalized to % Return Since Inception)
+    # ---------------------------------------------------------------
+    doc.add_heading("Portfolio Value Analysis", level=1)
+
+    doc.add_heading("Portfolio Value — Mountain Chart (Since-Inception % Return)", level=2)
+
+    # Build daily PV and forward-fill
+    pv_daily = pv.sort_index().reindex(
+        pd.date_range(pv.index.min(), pv.index.max(), freq="D")
+    ).ffill()
+
+    # Convert to % return since inception
+    pv0 = pv_daily.iloc[0]
+    pv_ret = (pv_daily / pv0 - 1.0) * 100.0
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.plot(pv_ret.index, pv_ret.values, linewidth=2, color="#1f77b4")
+    ax.fill_between(pv_ret.index, pv_ret.values, alpha=0.25, color="#1f77b4")
+
+    ax.set_title("Daily Portfolio Return Since Inception (Mountain Chart)")
+    ax.set_ylabel("Return (%)")
+    ax.grid(alpha=0.3)
+
+    # Limit x-axis to 6 ticks
+    xticks = np.linspace(0, len(pv_ret.index) - 1, 6, dtype=int)
+    ax.set_xticks(pv_ret.index[xticks])
+    fig.autofmt_xdate()
+
+    img_stream = BytesIO()
+    plt.savefig(img_stream, format="png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    img_stream.seek(0)
+
+    paragraph = doc.add_paragraph()
+    run = paragraph.add_run()
+    run.add_picture(img_stream, width=Inches(6))
+    paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    doc.add_paragraph(
+        "Figure: Portfolio value normalized to % return since inception. "
+        "Shows true performance shape even when dollar PV is flat.",
+        style="Normal"
+    ).alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    # ---------------------------------------------------------------
+    # DAILY ΔPV ATTRIBUTION — EXTERNAL FLOWS vs MARKET MOVE
+    # ---------------------------------------------------------------
+    doc.add_heading("Daily ΔPV Attribution", level=2)
+
+    # Build daily PV (fill missing days)
+    pv_trading = pv.sort_index().copy()
+    pv_daily = pv_trading.reindex(
+        pd.date_range(pv_trading.index.min(), pv_trading.index.max(), freq="D")
+    ).ffill()
+
+    # Daily ΔPV
+    dpv = pv_daily.diff().fillna(0.0)
+
+    # External flows per day
+    cf_all = load_cashflows_external().copy()
+    if not cf_all.empty:
+        cf_all = cf_all.sort_values("date")
+        ext_series = (
+            cf_all.groupby("date")["amount"]
+            .sum()
+            .reindex(pv_daily.index, fill_value=0.0)
+        )
+    else:
+        ext_series = pd.Series(0.0, index=pv_daily.index)
+
+    # Market component:
+    mkt_series = dpv - ext_series
+
+    # Last 30 days window
+    window_days = 30
+    end_date = pv_daily.index.max()
+    start_date = max(end_date - pd.Timedelta(days=window_days - 1), pv_daily.index.min())
+
+    mask = (pv_daily.index >= start_date) & (pv_daily.index <= end_date)
+    dates_win = pv_daily.index[mask]
+    dpv_win = dpv[mask]
+    ext_win = ext_series[mask]
+    mkt_win = mkt_series[mask]
+
+    # Cumulative ΔPV (rebased to 0)
+    cum_total = (ext_series + mkt_series).cumsum()
+    cum_win = cum_total[mask] - cum_total[mask].iloc[0]
+
+    import matplotlib.dates as mdates
+
+    fig, ax1 = plt.subplots(figsize=(9, 4.5))
+
+    # -------------------- STACKED BARS --------------------
+    ax1.bar(
+        dates_win,
+        ext_win,
+        label="External Flows",
+        width=0.9,
+    )
+    ax1.bar(
+        dates_win,
+        mkt_win,
+        bottom=ext_win,
+        label="Market Move",
+        width=0.9,
+    )
+
+    ax1.set_ylabel("Δ Portfolio Value ($)")
+    ax1.set_title("Daily ΔPV Attribution (External vs Market)")
+
+    # -----------------------------------------------------------
+    # X AXIS — EXACT YYYY-MM-DD AND EXACTLY 6 TICKS
+    # -----------------------------------------------------------
+    num_xticks = 6
+    tick_positions = np.linspace(
+        mdates.date2num(dates_win[0]),
+        mdates.date2num(dates_win[-1]),
+        num_xticks
+    )
+
+    ax1.set_xticks(tick_positions)
+    ax1.set_xticklabels(
+        [mdates.num2date(t).strftime("%Y-%m-%d") for t in tick_positions],
+        rotation=35,
+        ha="right"
+    )
+
+    # -----------------------------------------------------------
+    # Y AXIS — AUTO ZERO-CENTER FOR DELTA PV
+    # -----------------------------------------------------------
+    max_abs = max(abs(dpv_win.min()), abs(dpv_win.max()))
+    ax1.set_ylim(-max_abs * 1.1, max_abs * 1.1)
+
+    # -----------------------------------------------------------
+    # RIGHT AXIS — CUMULATIVE ΔPV
+    # -----------------------------------------------------------
+    ax2 = ax1.twinx()
+    ax2.plot(
+        dates_win,
+        cum_win,
+        linestyle="--",
+        marker="o",
+        linewidth=1.8,
+        label="Cumulative ΔPV",
+    )
+    ax2.set_ylabel("Cumulative ΔPV ($)")
+    ax2.yaxis.set_major_locator(plt.MaxNLocator(6))
+
+    # Left y-axis ticks
+    ax1.yaxis.set_major_locator(plt.MaxNLocator(6))
+
+    # Combine legends
+    handles1, labels1 = ax1.get_legend_handles_labels()
+    handles2, labels2 = ax2.get_legend_handles_labels()
+    ax1.legend(
+        handles1 + handles2,
+        labels1 + labels2,
+        loc="upper left",
+        fontsize=8,
+    )
+
+    plt.tight_layout()
+
+    img_stream = BytesIO()
+    plt.savefig(img_stream, format="png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    img_stream.seek(0)
+
+    paragraph = doc.add_paragraph()
+    run = paragraph.add_run()
+    run.add_picture(img_stream, width=Inches(6))
+    paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    caption = doc.add_paragraph(
+        "Figure: Daily decomposition of portfolio value changes into external flows "
+        "and market movements. Stacked bars sum to total ΔPV; the dashed line shows "
+        "cumulative ΔPV over the same window. Y-axis is auto-centered on zero.",
+        style="Normal",
+    )
+    caption.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    doc.add_page_break()
 
     # ---------------------------------------------------------------
     # LONG-TERM PROJECTION SCENARIOS (20 YEARS)
@@ -1914,8 +2271,70 @@ def build_report():
 
     caption = doc.add_paragraph("Figure: Trade-off between expected return and volatility.", style="Normal")
     caption.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    
+    # ---------------------------------------------------------------
+    # SECTOR ALLOCATION HEATMAP
+    # ---------------------------------------------------------------
+    doc.add_page_break()
+
+    # Hardcode ETF sector map from config
+    sector_exposure = defaultdict(float)
+
+    # Sector normalization to avoid duplicates
+    SECTOR_NORMALIZATION = {
+        "Comm Services": "Communication Services",
+        "Consumer Disc.": "Consumer Discretionary",
+        "Information Technology": "Tech",
+        "Other": None,  # ignore "Other" buckets
+    }
+
+    # Use raw market values and exclude CASH from the denominator so that
+    # sector weights are based on invested assets only.
+    sector_universe = sec_only[sec_only["ticker"].isin(ETF_SECTOR_MAP.keys())].copy()
+    sector_universe = sector_universe[sector_universe["value"] > 0]
+
+    total_invested = sector_universe["value"].sum()
+
+    if total_invested > 0:
+        for _, row in sector_universe.iterrows():
+            ticker = row["ticker"]
+            # weight of this holding as % of invested (non-CASH) assets
+            weight_pct = (row["value"] / total_invested) * 100.0
+
+            etf_sectors = ETF_SECTOR_MAP.get(ticker, {})
+            for sector, pct in etf_sectors.items():
+                norm_sector = SECTOR_NORMALIZATION.get(sector, sector)
+                if norm_sector is None:
+                    continue
+                sector_exposure[norm_sector] += weight_pct * pct / 100.0
 
 
+    # Convert to sorted DataFrame
+    sector_df = pd.DataFrame(
+        list(sector_exposure.items()),
+        columns=["Sector", "Exposure"]
+    ).sort_values("Exposure", ascending=True)
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.barh(sector_df["Sector"], sector_df["Exposure"], color="skyblue")
+    for i, v in enumerate(sector_df["Exposure"]):
+        ax.text(v + 0.3, i, f"{v:.1f}%", va="center", fontsize=9)
+
+    ax.set_xlabel("Portfolio Exposure (%)")
+    ax.set_title("Sector Allocation")
+    plt.tight_layout()
+
+    img_stream = BytesIO()
+    plt.savefig(img_stream, format="png", bbox_inches="tight", dpi=150)
+    plt.close(fig)
+    img_stream.seek(0)
+
+    doc.add_heading("Sector Allocation", level=1)
+    paragraph = doc.add_paragraph()
+    run = paragraph.add_run()
+    run.add_picture(img_stream, width=Inches(6))
+    paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    doc.add_paragraph("Figure: Approximate sector exposure for portfolio ETFs.", style="Normal").alignment = WD_ALIGN_PARAGRAPH.CENTER
 
     # =============================================================
     # SAVE OUTPUT
