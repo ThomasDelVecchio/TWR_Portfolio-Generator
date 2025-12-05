@@ -9,7 +9,7 @@ from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
 from docx2pdf import convert
 from config import TARGET_PORTFOLIO_VALUE, TARGET_MONTHLY_CONTRIBUTION
-from main1 import run_engine, fetch_price_history, load_cashflows_external
+from main1 import run_engine, fetch_price_history, load_cashflows_external, modified_dietz_for_ticker_window
 from io import BytesIO
 import matplotlib.pyplot as plt
 import os
@@ -130,7 +130,7 @@ def build_report():
 
     # Fix Security-level DF
     if not sec_full.empty:
-        for col in ["1D","1W","MTD","1M","3M","6M","YTD","1Y"]:
+        for col in ["1D", "1W", "MTD", "1M", "3M", "6M", "1Y", "YTD"]:
             if col in sec_full.columns:
                 sec_full[col] = sec_full[col].apply(fmt_pct_clean)
 
@@ -188,7 +188,7 @@ def build_report():
         snap_map[row["Horizon"]] = row["Return"]
 
     # Horizons in EXACT order
-    horizons = ["1D", "1W", "MTD", "1M", "3M", "6M", "YTD"]
+    horizons = ["1D", "1W", "MTD", "1M", "3M", "6M", "1Y"]
 
     # REAL P/L calculator using pv and external cashflows
     # P/L = MV_end − MV_start − net_external_flows(start, end)
@@ -203,6 +203,22 @@ def build_report():
         """
         pv_idx = pv.index.sort_values()
         as_of = pv_idx.max()
+        
+        # ============= SI (Since Inception) =============
+        if label == "SI":
+            start = inception_date
+
+            # Map inception_date onto first available PV date on/after it
+            if start not in pv.index:
+                pos = pv_idx.searchsorted(start)
+                if pos >= len(pv_idx):
+                    return None
+                start = pv_idx[pos]
+
+            if start >= as_of:
+                return None
+
+            return start
 
         # ============= MTD =============
         if label == "MTD":
@@ -471,10 +487,17 @@ def build_report():
     def compute_ticker_pl(ticker, h):
         """
         Correct economic P/L for a single ticker over a horizon.
+
         P/L = MV_end – MV_start – net_internal_flows(start, end)
+
+        SPECIAL CASE:
+          - For h == "SI": horizon is from this ticker's FIRST TRADE DATE
+            (not portfolio inception). This guarantees a non-NaN SI for any
+            ticker that has at least one transaction and price history.
         """
         if ticker == "CASH":
-            return "N/A"
+            # Treat CASH as 0% return, 0 P/L for horizons in this table.
+            return fmt_dollar_clean(0.0)
 
         # price series
         if ticker not in prices.columns:
@@ -487,56 +510,8 @@ def build_report():
         as_of_price = series.index.max()
         as_of = min(as_of_port, as_of_price)
 
-        # === Unified portfolio horizon start ===
-        raw_start = get_horizon_start(h)
-        if raw_start is None or raw_start >= as_of:
-            return "N/A"
-            
-        # Clamp start to the earliest price date for this ticker
-        earliest_px = series.index.min()
-        if raw_start < earliest_px:
-            raw_start = earliest_px
-
-
-        # Map portfolio horizon start onto this ticker's price series
-        series_dates = series.index.sort_values()
-
-        # === Map portfolio horizon start to this ticker's price series ===
-
-        # MTD uses same "last prior price" logic
-        if h == "MTD":
-            # raw_start = prior-month-end; use FIRST price *after* that date
-            idx = series_dates.searchsorted(raw_start)
-            if idx >= len(series_dates):
-                return "N/A"
-            start = series_dates[idx]
-
-
-        # 1D MUST use strict previous trading day only
-        elif h == "1D":
-            # 1D should match the portfolio horizon exactly: raw_start is the
-            # previous trading day at the portfolio level, so we want the
-            # first price on or AFTER raw_start for this ticker.
-            idx = series_dates.searchsorted(raw_start)
-            if idx >= len(series_dates):
-                return "N/A"
-            start = series_dates[idx]
-
-
-        #   All other horizons: nearest prior price
-        else:
-            idx = series_dates.searchsorted(raw_start, side="right") - 1
-            if idx < 0:
-                return "N/A"
-            start = series_dates[idx]
-
-
-
-        if start >= as_of:
-            return "N/A"
-
-        # ----- Load transactions -----
-        tx = load_transactions_raw()
+        # ----- Load transactions for this ticker -----
+        tx = load_transactions_raw().copy()
         tx = tx[tx["ticker"] == ticker].copy()
         tx = tx.sort_values("date")
 
@@ -545,11 +520,75 @@ def build_report():
 
         first_trade = tx["date"].min()
 
-        # Not owned at start → no P/L
-        if first_trade > start:
-            return "N/A"
+        # =================================================================
+        # SI: since *this ticker's* inception (first trade), not portfolio
+        # =================================================================
+        if h == "SI":
+            # Start at later of first trade and earliest price in the series
+            earliest_px = series.index.min()
+            raw_start = max(first_trade, earliest_px)
 
-        start = max(start, first_trade)
+            # Snap to the first available price ON or AFTER raw_start
+            series_dates = series.index.sort_values()
+            idx = series_dates.searchsorted(raw_start)
+            if idx >= len(series_dates):
+                return "N/A"
+
+            start = series_dates[idx]
+
+            if start >= as_of:
+                return "N/A"
+
+
+        else:
+            # =============================================================
+            # ORIGINAL HORIZON LOGIC (UNTOUCHED FOR NON-SI HORIZONS)
+            # =============================================================
+            raw_start = get_horizon_start(h)
+            if raw_start is None or raw_start >= as_of:
+                return "N/A"
+
+            # Clamp to earliest price date for this ticker
+            earliest_px = series.index.min()
+            if raw_start < earliest_px:
+                raw_start = earliest_px
+
+            series_dates = series.index.sort_values()
+
+            # MTD uses same "last prior price" logic
+            if h == "MTD":
+                # raw_start = prior-month-end; use FIRST price *after* that date
+                idx = series_dates.searchsorted(raw_start)
+                if idx >= len(series_dates):
+                    return "N/A"
+                start = series_dates[idx]
+
+            # 1D MUST use strict previous trading day only
+            elif h == "1D":
+                # 1D should match the portfolio horizon exactly: raw_start is the
+                # previous trading day at the portfolio level, so we want the
+                # first price on or AFTER raw_start for this ticker.
+                idx = series_dates.searchsorted(raw_start)
+                if idx >= len(series_dates):
+                    return "N/A"
+                start = series_dates[idx]
+
+            # All other horizons: nearest prior price
+            else:
+                idx = series_dates.searchsorted(raw_start, side="right") - 1
+                if idx < 0:
+                    return "N/A"
+                start = series_dates[idx]
+
+            if start >= as_of:
+                return "N/A"
+
+            # Not owned at start → no P/L
+            if first_trade > start:
+                return "N/A"
+
+            # Horizon must not start before first trade
+            start = max(start, first_trade)
 
         # ----- Prices -----
         try:
@@ -570,6 +609,8 @@ def build_report():
 
         # ----- Internal flows inside window -----
         mask2 = (tx["date"] > start) & (tx["date"] < as_of)
+        # Our file uses amount negative for buys (cash out), positive for sells (cash in).
+        # When computing economic P/L, we subtract net internal flows (same as before).
         net_internal = -tx.loc[mask2, "amount"].sum()
 
         # ----- Economic P/L -----
@@ -579,7 +620,6 @@ def build_report():
         pl = mv_end - mv_start - net_internal
 
         return fmt_dollar_clean(pl)
-
 
 
     # ---------------------------------------------------------------
@@ -1563,6 +1603,105 @@ def build_report():
 
     doc.add_page_break()
 
+    # =============================================================
+    # NEW: SINCE-INCEPTION (SI) RETURNS FOR TICKERS & ASSET CLASSES
+    # =============================================================
+
+    # We want a true SI return per ticker (since first trade),
+    # and a value-weighted rollup for each asset class.
+    si_return_map = {}
+
+    tx_all = load_transactions_raw().copy()
+    as_of_port = pv.index.max()
+
+    # Use the same price history we already fetched for tickers
+    # (non-CASH only; CASH gets 0%).
+    for t in sec_only["ticker"].unique():
+        if t == "CASH":
+            si_return_map[t] = 0.0
+            continue
+
+        if t not in prices.columns:
+            # No price history → treat as 0% to avoid N/A spam
+            si_return_map[t] = 0.0
+            continue
+
+        price_series = prices[t].dropna()
+        if price_series.empty:
+            si_return_map[t] = 0.0
+            continue
+
+        tx_t = tx_all[tx_all["ticker"] == t].copy()
+        if tx_t.empty:
+            # No transactions recorded → fallback to 0%
+            si_return_map[t] = 0.0
+            continue
+
+        tx_t = tx_t.sort_values("date")
+        first_trade = tx_t["date"].min()
+
+        # End date = min(portfolio PV max date, price series max date)
+        as_of_price = price_series.index.max()
+        end = min(as_of_port, as_of_price)
+
+        if end <= first_trade:
+            si_return_map[t] = 0.0
+            continue
+
+        # Run MD from first trade date
+        try:
+            si_ret = modified_dietz_for_ticker_window(
+                t,
+                price_series,
+                tx_t,
+                first_trade,
+                end,
+            )
+        except Exception:
+            si_ret = 0.0
+
+        # If MD blows up to NaN, treat as 0 to avoid N/A in the SI column
+        if pd.isna(si_ret):
+            si_ret = 0.0
+
+        si_return_map[t] = float(si_ret)
+
+    # Attach SI returns to security-level table as a DECIMAL,
+    # then we will format for display in the horizon table only.
+    if not sec_full.empty:
+        sec_full["SI"] = sec_full["ticker"].map(lambda t: si_return_map.get(t, 0.0))
+
+    # Now roll these up to asset classes, value-weighted by current MV.
+    if not class_full.empty:
+        # Merge current market value into a helper frame
+        sec_mv = sec_only[["ticker", "asset_class", "value"]].copy()
+        sec_mv["SI"] = sec_mv["ticker"].map(lambda t: si_return_map.get(t, 0.0))
+
+        si_by_class = {}
+        for ac, grp in sec_mv.groupby("asset_class"):
+            grp = grp.dropna(subset=["value"])
+            if grp.empty:
+                si_by_class[ac] = 0.0
+                continue
+
+            # Only tickers with non-null SI
+            sub = grp.dropna(subset=["SI"])
+            if sub.empty:
+                si_by_class[ac] = 0.0
+                continue
+
+            w = sub["value"] / sub["value"].sum()
+            si_by_class[ac] = float((w * sub["SI"]).sum())
+
+        # Add SI as decimal to class_full
+        class_full["SI"] = class_full["asset_class"].map(
+            lambda ac: si_by_class.get(ac, 0.0)
+        )
+
+    # Format ticker-level SI for display in the horizon table
+    if not sec_full.empty and "SI" in sec_full.columns:
+        sec_full["SI"] = sec_full["SI"].apply(fmt_pct_clean)
+
 
     # =============================================================
     # MULTI-HORIZON RETURNS BY ASSET CLASS & TICKER (MODIFIED DIETZ)
@@ -1571,7 +1710,7 @@ def build_report():
 
     doc.add_heading("Returns Grouped by Asset Class (Modified Dietz)", level=2)
 
-    horizon_cols = ["1D", "1W", "MTD", "1M", "3M", "6M", "YTD", "1Y"]
+    horizon_cols = ["1D", "1W", "MTD", "1M", "3M", "6M", "1Y", "SI"]
 
     if class_full.empty and sec_full.empty:
         doc.add_paragraph("No security-level cashflow data available.")
@@ -1579,8 +1718,14 @@ def build_report():
         # Make a formatted view of class_full so we don't double-multiply anything
         class_view = class_full.copy()
         for col in horizon_cols:
-            if col in class_view.columns:
+            if col in class_view.columns and col != "SI":
+                # Non-SI horizons: standard formatting
                 class_view[col] = class_view[col].apply(fmt_pct_clean)
+
+        # SI is a decimal; format it once here so asset-class SI shows as %.
+        if "SI" in class_view.columns:
+            class_view["SI"] = class_view["SI"].apply(fmt_pct_clean)
+
 
         # Order asset classes based on class_full
         asset_classes = (
@@ -1650,7 +1795,7 @@ def build_report():
 
     doc.add_heading("P/L Grouped by Asset Class", level=2)
 
-    horizons_pl = ["1D", "1W", "MTD", "1M", "3M", "6M", "YTD", "1Y"]
+    horizons_pl = ["1D", "1W", "MTD", "1M", "3M", "6M", "1Y", "SI"]
 
     if class_full.empty and sec_full.empty:
         doc.add_paragraph("No security-level cashflow data available.")
@@ -2415,3 +2560,4 @@ def build_report():
 
 if __name__ == "__main__":
     build_report()
+
