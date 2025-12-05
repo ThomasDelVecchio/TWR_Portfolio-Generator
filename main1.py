@@ -371,9 +371,10 @@ def compute_period_twr(
         return np.nan
 
     cf_window = cf[
-        (cf["date"] >= pv_window.index.min())
+        (cf["date"] > pv_window.index.min())   # strictly AFTER start
         & (cf["date"] <= pv_window.index.max())
     ].sort_values("date")
+
 
     if cf_window.empty:
         # No flows in the window: simple holding-period return
@@ -424,6 +425,133 @@ def compute_period_twr(
 
     return np.prod(sub_returns) - 1.0
 
+def get_portfolio_horizon_start(
+    pv: pd.Series,
+    inception_date: pd.Timestamp,
+    label: str,
+):
+    """
+    Canonical horizon start logic used for both:
+      - compute_horizon_twr (portfolio TWR)
+      - build_report horizon anchoring (P/L, charts, etc.)
+    Returns:
+      - pd.Timestamp start date if horizon is valid
+      - None if horizon is 'insufficient data'
+    """
+    as_of = pv.index.max()
+
+    # =============================
+    # MTD: from calendar month start or inception (whichever is later)
+    #      anchored at last trading day of prior month
+    # =============================
+    if label == "MTD":
+        prior_month_end = as_of.replace(day=1) - pd.Timedelta(days=1)
+
+        pv_idx = pv.index
+        prev_dates = pv_idx[pv_idx <= prior_month_end]
+        if len(prev_dates) == 0:
+            return None
+
+        start = prev_dates.max()
+
+        full_horizon_days = (as_of - start).days + 1
+        lived_days = (as_of - inception_date).days + 1
+
+        if lived_days < full_horizon_days:
+            return None
+        if start >= as_of:
+            return None
+
+        return start
+
+    # =============================
+    # YTD: ONLY if portfolio live on Jan 1
+    # =============================
+    if label == "YTD":
+        year_start = as_of.replace(month=1, day=1)
+
+        if inception_date > year_start:
+            return None
+
+        start = year_start
+        if start >= as_of:
+            return None
+
+        return start
+
+    # =============================
+    # FIXED 1D: previous trading day → as_of
+    # =============================
+    if label == "1D":
+        pv_dates = pv.index.sort_values()
+        prev_dates = pv_dates[pv_dates < as_of]
+        if len(prev_dates) == 0:
+            return None
+
+        start = prev_dates.max()
+
+        if inception_date > start:
+            return None
+
+        return start
+
+    # =============================
+    # Calendar 1M (GIPS-style)
+    # =============================
+    if label == "1M":
+        one_month_prior = as_of - pd.DateOffset(months=1)
+
+        pv_idx = pv.index
+        idx_pos = pv_idx.searchsorted(one_month_prior)
+        if idx_pos >= len(pv_idx):
+            return None
+
+        start = pv_idx[idx_pos]
+
+        full_horizon_days = (as_of - start).days + 1
+        lived_days = (as_of - inception_date).days + 1
+
+        if lived_days < full_horizon_days:
+            return None
+        if start >= as_of:
+            return None
+
+        return start
+
+    # =============================
+    # Rolling OTHER horizons
+    # =============================
+    days_map = {
+        "1W": 7,
+        "3M": 90,
+        "6M": 180,
+        "1Y": 365,
+        "3Y": 365 * 3,
+        "5Y": 365 * 5,
+    }
+
+    if label not in days_map:
+        raise ValueError(f"Unsupported horizon label: {label}")
+
+    full_horizon_days = days_map[label]
+    start = as_of - timedelta(days=full_horizon_days)
+
+    lived_days = (as_of - inception_date).days + 1
+    if lived_days < full_horizon_days:
+        return None
+
+    # If theoretical start is before PV exists at all, treat as insufficient data
+    if start < pv.index.min():
+        return None
+
+    if start < inception_date:
+        start = inception_date
+
+    if start >= as_of:
+        return None
+
+    return start
+
 
 def compute_horizon_twr(
     pv: pd.Series,
@@ -442,128 +570,11 @@ def compute_horizon_twr(
     """
     as_of = pv.index.max()
 
-    # =============================
-    # MTD: from max(month-start, inception)
-    # =============================
-    if label == "MTD":
-        # Last day of prior month
-        prior_month_end = as_of.replace(day=1) - pd.Timedelta(days=1)
-
-        # Find the last PV date on or before prior_month_end
-        pv_idx = pv.index
-        prev_dates = pv_idx[pv_idx <= prior_month_end]
-        if len(prev_dates) == 0:
-            return np.nan
-
-        start = prev_dates.max()
-
-        # Horizon length
-        full_horizon_days = (as_of - start).days + 1
-        lived_days = (as_of - inception_date).days + 1
-
-        # Must have lived the whole MTD period
-        if lived_days < full_horizon_days:
-            return np.nan
-
-        # Must have real start < end
-        if start >= as_of:
-            return np.nan
-
-        return compute_period_twr(pv, cf, start, as_of)
-
-
-    # =============================
-    # YTD: ONLY if portfolio live on Jan 1
-    # =============================
-    if label == "YTD":
-        year_start = as_of.replace(month=1, day=1)
-
-        # Institutional rule you want:
-        # If inception is AFTER Jan 1, YTD is NOT DEFINED => NaN
-        if inception_date > year_start:
-            return np.nan
-
-        start = year_start
-        if start >= as_of:
-            return np.nan
-
-        return compute_period_twr(pv, cf, start, as_of)
-
-    # =============================
-    # FIXED 1D: previous trading day → as_of
-    # =============================
-    if label == "1D":
-        pv_dates = pv.index.sort_values()
-        prev_dates = pv_dates[pv_dates < as_of]
-        if len(prev_dates) == 0:
-            return np.nan
-
-        start = prev_dates.max()
-
-        # Inception gating
-        if inception_date > start:
-            return np.nan
-
-        return compute_period_twr(pv, cf, start, as_of)
-  
-    # =============================
-    # Calendar 1M (GIPS-compliant)
-    # =============================
-    if label == "1M":
-        one_month_prior = as_of - pd.DateOffset(months=1)
-
-        pv_idx = pv.index
-        idx_pos = pv_idx.searchsorted(one_month_prior)
-        if idx_pos >= len(pv_idx):
-            return np.nan
-
-        start = pv_idx[idx_pos]
-
-        full_horizon_days = (as_of - start).days + 1
-        lived_days = (as_of - inception_date).days + 1
-
-        if lived_days < full_horizon_days:
-            return np.nan
-        if start >= as_of:
-            return np.nan
-
-        return compute_period_twr(pv, cf, start, as_of)
-
-
-    # =============================
-    # Rolling OTHER horizons
-    # =============================
-    days_map = {
-        "1W": 7,
-        "3M": 90,
-        "6M": 180,
-        "1Y": 365,
-        "3Y": 365 * 3,
-        "5Y": 365 * 5,
-    }
-
-    if label not in days_map:
-        raise ValueError(f"Unsupported horizon label: {label}")
-
-
-    full_horizon_days = days_map[label]
-    start = as_of - timedelta(days=full_horizon_days)
-
-    lived_days = (as_of - inception_date).days + 1
-    if lived_days < full_horizon_days:
-        return np.nan
-        
-    # If theoretical start is before PV exists at all, treat as insufficient data
-    if start < pv.index.min():
-        return np.nan
-
-    if start < inception_date:
-        start = inception_date
-    if start >= as_of:
+    start = get_portfolio_horizon_start(pv, inception_date, label)
+    if start is None:
         return np.nan
 
     return compute_period_twr(pv, cf, start, as_of)
-
 
 
 # ------------------------------------------------------------
