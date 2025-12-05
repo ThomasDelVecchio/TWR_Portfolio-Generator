@@ -389,10 +389,15 @@ def build_report():
             d1 = pv_dates[i]
 
             flow = cf_ext_local.loc[cf_ext_local["date"] == d1, "amount"].sum()
-            R = (pv.loc[d1] - pv.loc[d0] - flow) / pv.loc[d0]
+            denom = pv.loc[d0] + flow
+            if denom <= 0:
+                continue
+
+            R = (pv.loc[d1] - denom) / denom
             running *= (1 + R)
 
         return running - 1
+
 
 
     # Build vertical snapshot rows
@@ -1307,7 +1312,11 @@ def build_report():
         d1 = pv_dates[i]
 
         flow = cf_ext_local.loc[cf_ext_local["date"] == d1, "amount"].sum()
-        R = (pv.loc[d1] - pv.loc[d0] - flow) / pv.loc[d0]
+        denom = pv.loc[d0] + flow
+        if denom <= 0:
+            continue
+
+        R = (pv.loc[d1] - denom) / denom
         daily_ret.append((d1, R))
 
 
@@ -1317,6 +1326,7 @@ def build_report():
     for d,R in daily_ret:
         running *= (1 + R)
         twr_curve.loc[d] = running
+
 
     # Slice only the MTD part
     twr_mtd = twr_curve[twr_curve.index >= mtd_start_twr]
@@ -1658,13 +1668,14 @@ def build_report():
                 end,
             )
         except Exception:
-            si_ret = 0.0
+            si_ret = np.nan
 
-        # If MD blows up to NaN, treat as 0 to avoid N/A in the SI column
+        # If MD blows up to NaN, leave it as NaN so it shows as "N/A"
         if pd.isna(si_ret):
-            si_ret = 0.0
+            si_return_map[t] = np.nan
+        else:
+            si_return_map[t] = float(si_ret)
 
-        si_return_map[t] = float(si_ret)
 
     # Attach SI returns to security-level table as a DECIMAL,
     # then we will format for display in the horizon table only.
@@ -2560,4 +2571,3 @@ def build_report():
 
 if __name__ == "__main__":
     build_report()
-
