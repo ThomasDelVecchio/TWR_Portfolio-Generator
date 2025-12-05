@@ -9,7 +9,7 @@ from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
 from docx2pdf import convert
 from config import TARGET_PORTFOLIO_VALUE, TARGET_MONTHLY_CONTRIBUTION
-from main1 import run_engine, fetch_price_history, load_cashflows_external, modified_dietz_for_ticker_window
+from main1 import run_engine, fetch_price_history, load_cashflows_external, modified_dietz_for_ticker_window, get_portfolio_horizon_start
 from io import BytesIO
 import matplotlib.pyplot as plt
 import os
@@ -195,120 +195,11 @@ def build_report():
     
     def get_horizon_start(label: str) -> pd.Timestamp | None:
         """
-        Canonical horizon start, mirroring compute_horizon_twr logic.
-
-        Returns:
-          - pd.Timestamp start if horizon is valid
-          - None if horizon should be treated as 'insufficient data'
+        Thin wrapper around main1.get_portfolio_horizon_start so that
+        horizon anchors for P/L, benchmark charts, etc. are ALWAYS
+        identical to the ones used by compute_horizon_twr().
         """
-        pv_idx = pv.index.sort_values()
-        as_of = pv_idx.max()
-        
-        # ============= SI (Since Inception) =============
-        if label == "SI":
-            start = inception_date
-
-            # Map inception_date onto first available PV date on/after it
-            if start not in pv.index:
-                pos = pv_idx.searchsorted(start)
-                if pos >= len(pv_idx):
-                    return None
-                start = pv_idx[pos]
-
-            if start >= as_of:
-                return None
-
-            return start
-
-        # ============= MTD =============
-        if label == "MTD":
-            prior_month_end = as_of.replace(day=1) - pd.Timedelta(days=1)
-            prev_dates = pv_idx[pv_idx <= prior_month_end]
-            if len(prev_dates) == 0:
-                return None
-
-            start = prev_dates.max()
-            full_horizon_days = (as_of - start).days + 1
-            lived_days = (as_of - inception_date).days + 1
-
-            if lived_days < full_horizon_days:
-                return None
-            if start >= as_of:
-                return None
-
-            return start
-
-        # ============= YTD =============
-        if label == "YTD":
-            year_start = as_of.replace(month=1, day=1)
-
-            # Same institutional rule as compute_horizon_twr:
-            if inception_date > year_start:
-                return None
-
-            start = year_start
-            if start >= as_of:
-                return None
-
-            return start
-
-        # ============= 1D =============
-        if label == "1D":
-            prev_dates = pv_idx[pv_idx < as_of]
-            if len(prev_dates) == 0:
-                return None
-
-            start = prev_dates.max()
-            if inception_date > start:
-                return None
-
-            return start
-
-        # ============= 1M (calendar) =============
-        if label == "1M":
-            one_month_prior = as_of - pd.DateOffset(months=1)
-            idx_pos = pv_idx.searchsorted(one_month_prior)
-            if idx_pos >= len(pv_idx):
-                return None
-
-            start = pv_idx[idx_pos]
-            full_horizon_days = (as_of - start).days + 1
-            lived_days = (as_of - inception_date).days + 1
-
-            if lived_days < full_horizon_days:
-                return None
-            if start >= as_of:
-                return None
-
-            return start
-
-        # ============= Rolling 1W/3M/6M/1Y/3Y/5Y =============
-        days_map = {
-            "1W": 7,
-            "3M": 90,
-            "6M": 180,
-            "1Y": 365,
-            "3Y": 365 * 3,
-            "5Y": 365 * 5,
-        }
-
-        if label not in days_map:
-            return None
-
-        full_horizon_days = days_map[label]
-        start = as_of - pd.Timedelta(days=full_horizon_days)
-        if start < pv.index.min():
-            return None
-        lived_days = (as_of - inception_date).days + 1
-        if lived_days < full_horizon_days:
-            return None
-
-        if start < inception_date:
-            start = inception_date
-        if start >= as_of:
-            return None
-
-        return start
+        return get_portfolio_horizon_start(pv, inception_date, label)
 
 
     def compute_horizon_pl(h):
@@ -376,28 +267,12 @@ def build_report():
 
 
     def compute_since_inception_return():
-        """Time-weighted return from inception to today."""
-        # cumulative TWR = product of all daily returns - 1
-        as_of = pv.index.max()
-
-        cf_ext_local = load_cashflows_external().copy()
-        pv_dates = pv.index
-
-        running = 1.0
-        for i in range(1, len(pv_dates)):
-            d0 = pv_dates[i-1]
-            d1 = pv_dates[i]
-
-            flow = cf_ext_local.loc[cf_ext_local["date"] == d1, "amount"].sum()
-            denom = pv.loc[d0] + flow
-            if denom <= 0:
-                continue
-
-            R = (pv.loc[d1] - denom) / denom
-            running *= (1 + R)
-
-        return running - 1
-
+        """
+        Wrapper to expose the since-inception portfolio TWR that was
+        already computed in run_engine(). This avoids maintaining a
+        second TWR aggregation loop in this file.
+        """
+        return twr_si
 
 
     # Build vertical snapshot rows
@@ -2549,6 +2424,91 @@ def build_report():
     run.add_picture(img_stream, width=Inches(6))
     paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
     doc.add_paragraph("Figure: Approximate sector exposure for portfolio ETFs.", style="Normal").alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    # =============================================================
+    # METHODOLOGY APPENDIX (CLEAN ONE-PAGER)
+    # =============================================================
+    doc.add_page_break()
+    doc.add_heading("Appendix — Methodology Summary", level=1)
+
+    # Subtle intro line
+    p = doc.add_paragraph()
+    r = p.add_run("This page summarizes how the figures in this report are calculated.")
+    r.italic = True
+
+    # --- Data & Portfolio Value ---
+    p = doc.add_paragraph()
+    r = p.add_run("Data and portfolio value. ")
+    r.bold = True
+    p.add_run(
+        "Holdings, transactions, and cash flows are taken from the source files and combined with daily market prices "
+        "to build a consistent portfolio value series. External cash flows (deposits and withdrawals) are separated "
+        "from internal trading activity (buys and sells) so that performance can be evaluated independently of funding decisions."
+    )
+
+    # --- Portfolio Time-Weighted Returns (TWR) ---
+    p = doc.add_paragraph()
+    r = p.add_run("Portfolio time-weighted returns (TWR). ")
+    r.bold = True
+    p.add_run(
+        "Portfolio performance is reported using a flow-adjusted, time-weighted methodology. "
+        "External cash flows are treated as occurring at the start of the day, and the history is broken into segments "
+        "between flows. Returns for these segments are chained to produce cumulative TWR over each horizon, consistent "
+        "with institutional and GIPS-style practice."
+    )
+
+    # --- Security & Asset-Class Returns (Modified Dietz) ---
+    p = doc.add_paragraph()
+    r = p.add_run("Security and asset-class returns (Modified Dietz). ")
+    r.bold = True
+    p.add_run(
+        "For individual securities and asset classes, the report uses a Modified Dietz money-weighted approach. "
+        "All ticker-level cash flows (buys and sells) and prices over the horizon are included, and returns are "
+        "computed relative to an average invested capital base. Asset-class returns are formed as value-weighted "
+        "averages of the underlying security-level returns."
+    )
+
+    # --- Profit and Loss (P/L) ---
+    p = doc.add_paragraph()
+    r = p.add_run("Profit and loss (P/L). ")
+    r.bold = True
+    p.add_run(
+        "Economic P/L is defined consistently throughout the report as: MV_end minus MV_start minus net cash flows "
+        "over the period. At the portfolio level, cash flows are external only (contributions and withdrawals). "
+        "At the security and asset-class levels, P/L is based on internal trading flows and aligned to the same "
+        "time horizons used for the return calculations."
+    )
+
+    # --- Benchmarks & Comparisons ---
+    p = doc.add_paragraph()
+    r = p.add_run("Benchmarks and comparisons. ")
+    r.bold = True
+    p.add_run(
+        "Benchmark figures (such as broad equity or balanced indices) are shown as simple price returns. "
+        "They are rebased to the same start dates as the portfolio for each chart or table so that relative "
+        "performance reflects differences in allocation and market exposure rather than timing."
+    )
+
+    # --- Data Quality & Limitations ---
+    p = doc.add_paragraph()
+    r = p.add_run("Data quality and limitations. ")
+    r.bold = True
+    p.add_run(
+        "All results depend on the completeness and accuracy of the underlying holdings, transaction, cash flow, "
+        "and price data. Minor differences from broker statements may arise from rounding, pricing gaps, or "
+        "timing conventions, but these should not be material to the overall conclusions. The methodology is "
+        "designed to be transparent, repeatable, and suitable for executive-level review."
+    )
+
+    # Final short design principles list to make it "pop"
+    doc.add_paragraph("Core design principles:", style="Normal")
+    b = doc.add_paragraph(style="List Bullet")
+    b.add_run("Separate funding decisions (flows) from investment performance.")
+    b = doc.add_paragraph(style="List Bullet")
+    b.add_run("Use true time-weighted returns at the portfolio level.")
+    b = doc.add_paragraph(style="List Bullet")
+    b.add_run("Use money-weighted, cash-flow-aware math for securities and asset classes.")
+
 
     # =============================================================
     # SAVE OUTPUT
