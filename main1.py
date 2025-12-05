@@ -396,10 +396,10 @@ def compute_period_twr(
 
     for i in range(len(boundaries) - 1):
         start = pv_window.index[
-            pv_window.index.get_indexer([boundaries[i]], method="nearest")[0]
+            pv_window.index.get_indexer([boundaries[i]], method="backfill")[0]
         ]
         end = pv_window.index[
-            pv_window.index.get_indexer([boundaries[i+1]], method="nearest")[0]
+            pv_window.index.get_indexer([boundaries[i+1]], method="backfill")[0]
         ]
 
         pv_start = pv_window.loc[start]
@@ -551,6 +551,10 @@ def compute_horizon_twr(
 
     lived_days = (as_of - inception_date).days + 1
     if lived_days < full_horizon_days:
+        return np.nan
+        
+    # If theoretical start is before PV exists at all, treat as insufficient data
+    if start < pv.index.min():
         return np.nan
 
     if start < inception_date:
@@ -788,6 +792,13 @@ def compute_security_modified_dietz(
             # ------------------------------
             effective_start = max(start, earliest_price, first_tx_date)
 
+            # If clamping pushed the start too far forward, we no longer have
+            # a full horizon → treat as insufficient data
+            actual_days = (as_of - effective_start).days + 1
+            if actual_days < horizon_days:
+                row[h] = np.nan
+                continue
+
             # ------------------------------
             # Step 4 — Safe MD computation
             # ------------------------------
@@ -799,6 +810,7 @@ def compute_security_modified_dietz(
                 as_of,
             )
             row[h] = md_ret
+
 
         rows.append(row)
 
