@@ -1040,29 +1040,6 @@ def run_engine():
                 np.nan,
             )
 
-    # =========================================================
-    # DEBUG: sanity check 1W vs MTD MD returns in sec_table
-    # =========================================================
-    if isinstance(sec_table, pd.DataFrame) and "1W" in sec_table.columns and "MTD" in sec_table.columns:
-        print("\n=== DEBUG: 1W vs MTD MD by ticker (engine) ===")
-        try:
-            tmp = sec_table[["ticker", "1W", "MTD"]].copy()
-        except KeyError:
-            tmp = sec_table.reset_index()[["ticker", "1W", "MTD"]].copy()
-
-        print(tmp.to_string(index=False))
-
-        eq_mask = (pd.to_numeric(tmp["1W"], errors="coerce").round(6)
-                   == pd.to_numeric(tmp["MTD"], errors="coerce").round(6))
-        print("\nAll 1W == MTD?", bool(eq_mask.all()))
-        if not eq_mask.all():
-            print("\nTickers where 1W != MTD:")
-            print(tmp.loc[~eq_mask])
-        else:
-            print("1W column appears identical to MTD (this is your bug).")
-
-
-
     return twr_df, sec_table, class_df, pv, twr_since_inception, twr_since_inception_annualized, pl_since_inception
 
 
