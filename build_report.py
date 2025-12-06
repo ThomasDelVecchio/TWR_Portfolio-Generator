@@ -18,6 +18,38 @@ from collections import defaultdict
 from main1 import load_transactions_raw
 from datetime import datetime
 
+# ============================================================
+# GLOBAL COLOR PALETTE FOR ALL CHARTS
+# ============================================================
+GLOBAL_PALETTE = [
+    "#4C6A92",  # steel blue
+    "#8C9CB1",  # soft gray-blue
+    "#C0504D",  # muted red
+    "#D79E9C",  # soft red-gray
+    "#9BBB59",  # olive green
+    "#C5D6A4",  # light olive
+    "#8064A2",  # muted purple
+    "#B1A0C7",  # lavender gray
+    "#4F81BD",  # corporate blue
+    "#A5B5CF",  # cool gray-blue
+    "#F2C200",  # muted gold (accent)
+    "#D6B656",  # soft gold-gray
+]
+
+import matplotlib as mpl
+
+# Apply palette to ALL charts automatically
+mpl.rcParams['axes.prop_cycle'] = mpl.cycler(color=GLOBAL_PALETTE)
+
+# Optional consistent styling defaults
+mpl.rcParams['figure.dpi'] = 150
+mpl.rcParams['savefig.dpi'] = 150
+mpl.rcParams['axes.titlesize'] = 12
+mpl.rcParams['axes.labelsize'] = 11
+mpl.rcParams['xtick.labelsize'] = 10
+mpl.rcParams['ytick.labelsize'] = 10
+mpl.rcParams['legend.fontsize'] = 10
+
 # =====================================================================
 # Formatting Helpers (FULL N/A FIX)
 # =====================================================================
@@ -895,7 +927,6 @@ def build_report():
 
     ticker_labels = ticker_group["ticker"].tolist()
     ticker_values = ticker_group["value"].tolist()
-    colors = plt.cm.tab20.colors[:len(ticker_labels)]  # distinct colors
 
     fig, ax = plt.subplots(figsize=(6, 6))
     wedges, texts, autotexts = ax.pie(
@@ -903,7 +934,6 @@ def build_report():
         labels=ticker_labels,
         autopct="%1.1f%%",
         startangle=90,
-        colors=colors,
         wedgeprops={"edgecolor": "w"},
         pctdistance=0.75,  # move % labels outward to reduce overlap
         labeldistance=1.05  # labels slightly outside
@@ -980,7 +1010,7 @@ def build_report():
     ax.set_xticks(x)
     ax.set_xticklabels(ticker_merge["ticker"], rotation=45, ha="right", fontsize=9)
     ax.set_ylabel("Allocation (%)")
-    ax.set_title("Ticker Allocation vs Target")
+    ax.set_title("")
     ax.legend()
     plt.tight_layout()
 
@@ -1085,7 +1115,7 @@ def build_report():
     ax.set_xticks([i + width/2 for i in x])
     ax.set_xticklabels(ticker_merge["asset_class_short"], rotation=45, ha="right", fontsize=10)
     ax.set_ylabel("Allocation (%)")
-    ax.set_title("Asset Class Allocation vs Target")
+    ax.set_title("")
     ax.legend()
 
     img_stream = BytesIO()
@@ -1099,6 +1129,215 @@ def build_report():
     run = paragraph.add_run()
     run.add_picture(img_stream, width=Inches(6))
     paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    # ---------------------------------------------------------------
+    # ASSET ALLOCATION OVER TIME — STACKED AREA CHART
+    # ---------------------------------------------------------------
+    doc.add_heading("Asset Allocation Over Time", level=2)
+
+    try:
+        tx_hist = load_transactions_raw().copy()
+
+        # Need both transactions and prices to build history
+        if tx_hist.empty or prices.empty:
+            doc.add_paragraph(
+                "Insufficient transaction or price history to build an allocation-over-time chart."
+            )
+        else:
+
+            # ---------------------------------------------------------------
+            # Build a continuous daily index & forward-fill PV
+            # ---------------------------------------------------------------
+            full_index = pd.date_range(
+                start=pv.index.min(),
+                end=pv.index.max(),
+                freq="D"
+            )
+
+            pv_mod = pv.reindex(full_index).ffill()
+            alloc_index = full_index
+
+            # Pivot transactions into daily share changes per ticker
+            tx_hist["date"] = pd.to_datetime(tx_hist["date"])
+            pos_changes = (
+                tx_hist
+                .pivot_table(
+                    index="date",
+                    columns="ticker",
+                    values="shares",
+                    aggfunc="sum"
+                )
+                .sort_index()
+            )
+
+            # Align positions to full daily index, FF to avoid dips
+            pos_changes = pos_changes.reindex(alloc_index, fill_value=0.0)
+            pos_daily = pos_changes.cumsum().ffill().bfill()
+
+            # -------------------------------------------------------
+            # Reconcile position history to current holdings
+            # -------------------------------------------------------
+            shares_map = (
+                sec_only[["ticker", "shares"]]
+                .set_index("ticker")["shares"]
+                .to_dict()
+            )
+
+            # Adjust existing ticker columns to match final snapshot
+            for t in list(pos_daily.columns):
+                if t == "CASH":
+                    continue
+                if t in shares_map:
+                    target = float(shares_map[t])
+                    current = float(pos_daily[t].iloc[-1])
+                    diff = target - current
+                    if abs(diff) > 1e-8:
+                        pos_daily[t] = pos_daily[t] + diff
+
+            # Add static columns for tickers never seen in tx_hist
+            for t, shares in shares_map.items():
+                if t == "CASH":
+                    continue
+                if t not in pos_daily.columns and t in prices.columns:
+                    pos_daily[t] = float(shares)
+
+            # Restrict to tickers we actually have prices for
+            common_tickers = [t for t in pos_daily.columns if t in prices.columns]
+
+            if not common_tickers:
+                doc.add_paragraph(
+                    "No overlapping tickers between transactions and price history."
+                )
+            else:
+                pos_daily = pos_daily[common_tickers]
+
+                # Forward-fill prices on full daily index
+                px_aligned = (
+                    prices[common_tickers]
+                    .reindex(alloc_index)
+                    .ffill()
+                    .bfill()
+                )
+
+                # Daily market value per ticker
+                mv_daily = pos_daily * px_aligned
+
+                # Map tickers → asset classes
+                holdings_map = (
+                    holdings_df[["ticker", "asset_class"]]
+                    .drop_duplicates()
+                    .set_index("ticker")["asset_class"]
+                    .to_dict()
+                )
+
+                def map_asset_class_short(ticker: str) -> str:
+                    full = holdings_map.get(ticker, "Unknown")
+                    return asset_class_map.get(full, full)
+
+                mv_daily.columns = [map_asset_class_short(t) for t in mv_daily.columns]
+
+                # Aggregate by asset class
+                mv_by_class = mv_daily.groupby(axis=1, level=0).sum()
+
+                # Align PV
+                pv_mod_aligned = pv_mod.reindex(mv_by_class.index).ffill().bfill()
+                invested_total = mv_by_class.sum(axis=1)
+                cash_series = pv_mod_aligned - invested_total
+                mv_by_class["Cash"] = cash_series
+
+                # Convert to allocation percentages
+                total_mv = mv_by_class.sum(axis=1).replace(0, np.nan)
+                alloc = mv_by_class.div(total_mv, axis=0).dropna(how="all")
+
+                if alloc.empty:
+                    doc.add_paragraph(
+                        "No valid allocation history could be computed."
+                    )
+                else:
+                    alloc_pct = alloc * 100.0
+
+                    # ----------------------------------------------------------
+                    # VISUAL-ONLY SMOOTHING (preserve row sum = 100%)
+                    # ----------------------------------------------------------
+                    kernel = np.array([0.25, 0.5, 0.25])
+
+                    smooth_mat = []
+                    for col in alloc_pct.columns:
+                        series = alloc_pct[col].values
+                        s = np.convolve(series, kernel, mode="same")
+                        smooth_mat.append(s)
+
+                    # Stack: (num_classes × num_days)
+                    smooth_arr = np.vstack(smooth_mat)
+
+                    # Renormalize to 100% exactly
+                    row_sums = smooth_arr.sum(axis=0)
+                    row_sums[row_sums == 0] = np.nan
+                    smooth_arr = (smooth_arr / row_sums) * 100.0
+
+                    # ----------------------------------------------------------
+                    # PLOT — Bigger, cleaner, softer
+                    # ----------------------------------------------------------
+                    fig, ax = plt.subplots(figsize=(14, 9))
+
+                    ax.stackplot(
+                        alloc_pct.index,
+                        smooth_arr,
+                        labels=list(alloc_pct.columns),
+                        alpha=0.92,
+                        linewidth=0,
+                        antialiased=True
+                    )
+
+
+                    FONT_SCALE = 1.5
+
+                    ax.set_title("")
+                    fig.suptitle("")
+                    ax.set_ylabel(
+                        "Allocation (%)",
+                        fontsize=int(11 * FONT_SCALE)   
+                    )
+
+                    ax.tick_params(
+                        axis="both",
+                        labelsize=int(10 * FONT_SCALE)   
+                    )
+
+                    legend = ax.legend(
+                        loc="upper left",
+                        fontsize=int(10 * FONT_SCALE),    
+                        ncol=3
+                    )
+                    for txt in legend.get_texts():
+                        txt.set_fontsize(int(10 * FONT_SCALE))
+
+                    fig.autofmt_xdate()
+
+                    fig.tight_layout()
+
+
+                    img_stream = BytesIO()
+                    plt.savefig(img_stream, format="png", dpi=150, bbox_inches="tight")
+                    plt.close(fig)
+                    img_stream.seek(0)
+
+                    paragraph = doc.add_paragraph()
+                    run = paragraph.add_run()
+                    run.add_picture(img_stream, width=Inches(7))
+                    paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+                    cap = doc.add_paragraph(
+                        "Figure: Daily asset class allocation over time, including cash.",
+                        style="Normal",
+                    )
+                    cap.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    except Exception:
+        doc.add_paragraph(
+            "Asset allocation over time chart could not be generated.",
+            style="Normal"
+        )
 
 
     # ---------------------------------------------------------------
@@ -1232,20 +1471,32 @@ def build_report():
         except:
             pass
 
-    # Plot
-    fig, ax = plt.subplots(figsize=(10, 5))
+    # ---------------- UPDATED MTD CHART (Option C sizing + matching fonts) ----------------
+    fig, ax = plt.subplots(figsize=(12, 6.5))
 
     # Portfolio curve
-    ax.plot(twr_mtd.index, twr_mtd.values, linewidth=2, label="Portfolio (TWR-Based)")
-
+    ax.plot(
+        twr_mtd.index,
+        twr_mtd.values,
+        linewidth=2,
+        label="Portfolio (TWR-Based)"
+    )
 
     # Benchmarks
     for name, series in benchmark_curves_mtd.items():
-        ax.plot(series.index, series.values, label=name, linewidth=1.6)
+        ax.plot(
+            series.index,
+            series.values,
+            linewidth=1.6,
+            label=name
+        )
 
-    ax.set_ylabel("Cumulative Return (%)")
-    ax.set_title("MTD Cumulative Return — Portfolio vs Benchmarks")
-    ax.legend(fontsize=8)
+    # ======== MATCH BAR CHART FONTS EXACTLY ========
+    ax.set_title("")
+    ax.set_ylabel("Cumulative Return (%)", fontsize=11)
+    ax.tick_params(axis="both", labelsize=10)
+    ax.legend(fontsize=10)
+
     plt.tight_layout()
 
     # Save and insert
@@ -1256,8 +1507,9 @@ def build_report():
 
     paragraph = doc.add_paragraph()
     run = paragraph.add_run()
-    run.add_picture(img_stream, width=Inches(6))
+    run.add_picture(img_stream, width=Inches(6.5))   # <<< bigger but not full-page
     paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
 
     doc.add_paragraph(
         "Figure: Portfolio returns use true TWR based on a flow-adjusted, end-of-day PV series (external flows treated at start-of-day). Benchmark returns use simple price return and are rebased to the same start date for comparability.",
@@ -1352,7 +1604,7 @@ def build_report():
     doc.add_page_break()
     
     # ---------------- SINCE INCEPTION CHART (TWR vs Benchmarks) ----------------
-    fig, ax = plt.subplots(figsize=(10, 5))
+    fig, ax = plt.subplots(figsize=(12, 6.5))
 
     import matplotlib.dates as mdates
 
@@ -1362,8 +1614,6 @@ def build_report():
 
     # Force full date format
     ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
-
-
 
     # Portfolio since-inception TWR curve (twr_curve is already cumulative)
     twr_si_curve = twr_curve.copy()
@@ -1404,11 +1654,15 @@ def build_report():
     for name, series in benchmark_curves_si.items():
         ax.plot(series.index, series.values, label=name, linewidth=1.6)
 
-    ax.set_ylabel("Cumulative Return (%)")
-    ax.set_title("Since Inception Cumulative Return — Portfolio vs Benchmarks")
-    ax.legend(fontsize=8)
+    # ---------- FONT FIXES (MATCH MTD + BAR CHART) ----------
+    ax.set_title("")
+    ax.set_ylabel("Cumulative Return (%)", fontsize=11)
+    ax.tick_params(axis="both", labelsize=10)
+    ax.legend(fontsize=10)
+
     plt.tight_layout()
     fig.autofmt_xdate()
+
     img_stream = BytesIO()
     plt.savefig(img_stream, format="png", dpi=150, bbox_inches="tight")
     plt.close(fig)
@@ -1416,14 +1670,17 @@ def build_report():
 
     doc.add_heading("Since Inception Cumulative Return — Portfolio vs Benchmarks", level=2)
     paragraph = doc.add_paragraph()
-    run = paragraph.add_run()
-    run.add_picture(img_stream, width=Inches(6))
     paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    run = paragraph.add_run()
+    run.add_picture(img_stream, width=Inches(6.5))   # MATCH MTD WIDTH EXACTLY
+    paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
     doc.add_paragraph(
         "Figure: Portfolio curve uses true since-inception TWR based on the flow-adjusted PV series. "
         "Benchmarks use simple price returns rebased to the same since-inception start date.",
         style="Normal"
     ).alignment = WD_ALIGN_PARAGRAPH.CENTER
+
 
     # ---------------------------------------------------------------
     # PERFORMANCE VS BENCHMARKS (SINCE INCEPTION — TWR Consistent)
@@ -1893,18 +2150,15 @@ def build_report():
         # Build stacked bar (fixed)
         fig, ax = plt.subplots(figsize=(9, 5.5))
 
-        # nice distinct colors
-        colors = plt.cm.tab20(np.linspace(0, 1, len(net_by_class)))
 
         left_edge = 0
         labels = []
 
-        for (cls, val), c in zip(net_by_class.items(), colors):
+        for cls, val in net_by_class.items():
             ax.barh(
                 ["Net Flows"],
                 val,
                 left=left_edge,
-                color=c,
                 label=f"{cls} (${val:,.0f})"
             )
             left_edge += val
@@ -1914,10 +2168,7 @@ def build_report():
         min_left = min(0, left_edge)
         ax.set_xlim(min_left * 1.05, max_right * 1.05)
 
-        ax.set_title(
-            "Net Internal Trading Flows — Stacked by Asset Class",
-            fontweight="bold"
-        )
+        ax.set_title("")
 
         ax.set_xlabel("Net Cash Flow ($)")
         ax.grid(axis="x", linestyle="--", alpha=0.4)
@@ -1959,10 +2210,10 @@ def build_report():
     pv_ret = (pv_daily / pv0 - 1.0) * 100.0
 
     fig, ax = plt.subplots(figsize=(10, 5))
-    ax.plot(pv_ret.index, pv_ret.values, linewidth=2, color="#1f77b4")
-    ax.fill_between(pv_ret.index, pv_ret.values, alpha=0.25, color="#1f77b4")
+    ax.plot(pv_ret.index, pv_ret.values, linewidth=2)
+    ax.fill_between(pv_ret.index, pv_ret.values, alpha=0.25)
 
-    ax.set_title("Daily Portfolio Return Since Inception (Mountain Chart)")
+    ax.set_title("")
     ax.set_ylabel("Return (%)")
     ax.grid(alpha=0.3)
 
@@ -2079,7 +2330,7 @@ def build_report():
 
 
     ax1.set_ylabel("Δ Portfolio Value ($)")
-    ax1.set_title("Daily ΔPV Attribution (External vs Market)")
+    ax1.set_title("")
 
     # -----------------------------------------------------------
     # X AXIS — EXACT YYYY-MM-DD AND EXACTLY 6 TICKS
@@ -2251,8 +2502,7 @@ def build_report():
     ax.ticklabel_format(style='plain', axis='y')
     ax.get_yaxis().set_major_formatter(plt.FuncFormatter(lambda x, pos: f"${x:,.0f}"))
 
-    title = ax.set_title("Portfolio Growth Projections (20-Year Scenarios)")
-    title.set_fontweight("bold")
+    ax.set_title("")
     ax.legend(fontsize=8)
     plt.tight_layout()
 
@@ -2295,9 +2545,9 @@ def build_report():
     vol_vals = list(vol_data.values())
 
     fig, ax = plt.subplots(figsize=(8,5))
-    bars = ax.bar(classes, vol_vals, color="#4A90E2")
+    bars = ax.bar(classes, vol_vals)
 
-    ax.set_title("Expected Volatility by Asset Class", fontsize=14, fontweight="bold")
+    ax.set_title("")
     ax.set_ylabel("Std Dev (%)")
 
     plt.xticks(rotation=25, ha="right")
@@ -2336,14 +2586,14 @@ def build_report():
     labels = list(exp_return_data.keys())
 
     fig, ax = plt.subplots(figsize=(8,5))
-    ax.scatter(vols, rets, s=80, color="#2ECC71")
+    ax.scatter(vols, rets, s=80)
 
     for i, label in enumerate(labels):
         ax.annotate(label, (vols[i] + 0.5, rets[i] + 0.1), fontsize=9)
 
     ax.set_xlabel("Volatility (%)")
     ax.set_ylabel("Expected Annual Return (%)")
-    ax.set_title("Risk vs Expected Return", fontsize=14, fontweight="bold")
+    ax.set_title("")
     ax.grid(True, linestyle="--", alpha=0.4)
 
     plt.tight_layout()
@@ -2405,12 +2655,12 @@ def build_report():
     ).sort_values("Exposure", ascending=True)
 
     fig, ax = plt.subplots(figsize=(10, 6))
-    ax.barh(sector_df["Sector"], sector_df["Exposure"], color="skyblue")
+    ax.barh(sector_df["Sector"], sector_df["Exposure"])
     for i, v in enumerate(sector_df["Exposure"]):
         ax.text(v + 0.3, i, f"{v:.1f}%", va="center", fontsize=9)
 
     ax.set_xlabel("Portfolio Exposure (%)")
-    ax.set_title("Sector Allocation")
+    ax.set_title("")
     plt.tight_layout()
 
     img_stream = BytesIO()
