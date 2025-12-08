@@ -1499,11 +1499,17 @@ def build_report():
             label=name
         )
 
-    # ======== MATCH BAR CHART FONTS EXACTLY ========
+    # ======== FIX FONTS: larger labels, ticks, legend ========
     ax.set_title("")
-    ax.set_ylabel("Cumulative Return (%)", fontsize=11)
-    ax.tick_params(axis="both", labelsize=10)
-    ax.legend(fontsize=10)
+    ax.set_ylabel("Cumulative Return (%)", fontsize=13)
+    ax.set_xlabel("")  # if you ever add one later, this fixes font
+    ax.tick_params(axis="both", labelsize=11)
+
+    leg = ax.legend(fontsize=10)
+    if leg:
+        for text in leg.get_texts():
+            text.set_fontsize(10)
+
 
     plt.tight_layout()
 
@@ -1528,26 +1534,31 @@ def build_report():
     # ---------------- SINCE INCEPTION CHART (TWR vs Benchmarks) ----------------
     fig, ax = plt.subplots(figsize=(12, 6.5))
 
-    import matplotlib.dates as mdates
-
-    # Dynamic locator but limited tick count
-    locator = mdates.AutoDateLocator(minticks=6, maxticks=6)
-    ax.xaxis.set_major_locator(locator)
-
-    # Force full date format
-    ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
-
-    # Portfolio since-inception TWR curve (twr_curve is already cumulative)
+    # ---- build SI pct curve BEFORE any x-axis work ----
     twr_si_curve = twr_curve.copy()
     twr_si_pct = (twr_si_curve - 1.0) * 100.0
+    si_idx = twr_si_pct.index
 
+    # ---------------------- FORCE EXACTLY 6 DATE TICKS ----------------------
+    import matplotlib.dates as mdates
+    date_nums = mdates.date2num(si_idx)
 
+    tick_positions = np.linspace(date_nums.min(), date_nums.max(), 6)
+    ax.set_xticks(tick_positions)
+    ax.set_xticklabels(
+        [mdates.num2date(t).strftime("%Y-%m-%d") for t in tick_positions],
+        rotation=30,
+        ha="right"
+    )
+
+    # ---- plot portfolio SI curve ----
     ax.plot(
         twr_si_pct.index,
         twr_si_pct.values,
         label="Portfolio (TWR Since Inception)",
         linewidth=2,
     )
+
 
     # Benchmarks since inception — price return rebased to si_start
     benchmark_map = {
@@ -1576,11 +1587,19 @@ def build_report():
     for name, series in benchmark_curves_si.items():
         ax.plot(series.index, series.values, label=name, linewidth=1.6)
 
-    # ---------- FONT FIXES (MATCH MTD + BAR CHART) ----------
+    # -------- FONT FIXES (larger) --------
     ax.set_title("")
-    ax.set_ylabel("Cumulative Return (%)", fontsize=11)
-    ax.tick_params(axis="both", labelsize=10)
-    ax.legend(fontsize=10)
+    ax.set_ylabel("Cumulative Return (%)", fontsize=13)
+    ax.set_xlabel("")  # cleaner bottom spacing
+    ax.tick_params(axis="both", labelsize=11)
+
+
+    # -------- LEGEND FIX --------
+    leg = ax.legend(fontsize=10)
+    if leg:
+        for text in leg.get_texts():
+            text.set_fontsize(10)
+
 
     plt.tight_layout()
     fig.autofmt_xdate()
@@ -1748,8 +1767,94 @@ def build_report():
         style="Normal"
     )
 
-    doc.add_page_break()
+    # -----------------------------------------------------------
+    # EXCESS RETURN VS BENCHMARKS (BY HORIZON) — FINAL VERSION
+    # -----------------------------------------------------------
+    doc.add_heading("Excess Return vs Benchmarks (by Horizon)", level=3)
 
+    horizons_plot = ["1D", "1W", "MTD", "1M", "3M", "6M", "1Y", "SI"]
+    bm_labels = list(bm_defs.keys())  # e.g. ["S&P 500 %", "Global 60/40 %", "Conservative 40/60 %"]
+
+    # --- Local helper ---
+    def compute_bm_ret(col_label: str, horizon: str) -> float:
+        ser = bm_prices.get(col_label)
+        if ser is None or ser.empty:
+            return np.nan
+        if horizon == "SI":
+            start = si_start
+        else:
+            start = get_horizon_start(horizon)
+        if start is None:
+            return np.nan
+        ser_h = ser[ser.index >= start]
+        if len(ser_h) < 2:
+            return np.nan
+        return ser_h.iloc[-1] / ser_h.iloc[0] - 1.0  # decimal return
+
+    # --- Build numeric excess matrix (Portfolio − Benchmark) ---
+    excess = {bm: [] for bm in bm_labels}
+
+    for h in horizons_plot:
+        p_val = port_ret_num.get(h, np.nan)
+        for bm in bm_labels:
+            b_val = compute_bm_ret(bm, h)
+            if pd.isna(p_val) or pd.isna(b_val):
+                excess[bm].append(np.nan)
+            else:
+                excess[bm].append((p_val - b_val) * 100.0)  # percent points
+
+    # --- Grouped bar chart ---
+    x = np.arange(len(horizons_plot))
+    width = 0.25
+    fig, ax = plt.subplots(figsize=(7.0, 4.6))  # Taller to avoid squished look
+
+    offsets = [-width, 0, width]
+
+    # Use global Matplotlib color cycle (matches rest of report)
+    for i, bm in enumerate(bm_labels):
+        vals = np.array(excess[bm], dtype=float)
+        mask = np.isnan(vals)
+        vals_plot = np.where(mask, 0.0, vals)
+        bars = ax.bar(x + offsets[i], vals_plot, width=width, label=bm.replace(" %", ""))
+        for j, bar in enumerate(bars):
+            if mask[j]:
+                bar.set_alpha(0.0)
+
+    # --- Style tweaks ---
+    ax.axhline(0, color="gray", linewidth=0.8)
+    ax.set_xticks(x)
+    ax.set_xticklabels(horizons_plot)
+    ax.set_ylabel("Excess Return (%)")
+    ax.yaxis.set_major_locator(plt.MaxNLocator(6))
+
+    # Auto-scale Y-axis to data
+    all_vals = np.concatenate([np.array(v, dtype=float) for v in excess.values()])
+    all_vals = all_vals[~np.isnan(all_vals)]
+    if len(all_vals) > 0:
+        ylim = max(0.5, np.nanmax(np.abs(all_vals)) * 1.25)
+        ax.set_ylim(-ylim, ylim)
+
+    ax.legend(fontsize=8, ncol=3, loc="upper center", bbox_to_anchor=(0.5, -0.18))
+    plt.tight_layout()
+
+    # --- Export to docx ---
+    img_stream = BytesIO()
+    plt.savefig(img_stream, format="png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    img_stream.seek(0)
+
+    paragraph = doc.add_paragraph()
+    run = paragraph.add_run()
+    run.add_picture(img_stream, width=Inches(6.4))
+    paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    cap = doc.add_paragraph(
+        "Positive bars show outperformance; negative bars show underperformance.",
+        style="Normal",
+    )
+    cap.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    doc.add_page_break()
 
 
     # =============================================================
@@ -2788,3 +2893,4 @@ def build_report():
 
 if __name__ == "__main__":
     build_report()
+
