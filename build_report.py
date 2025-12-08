@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 import pandas as pd
 import numpy as np
@@ -11,6 +10,9 @@ from docx2pdf import convert
 from config import TARGET_PORTFOLIO_VALUE, TARGET_MONTHLY_CONTRIBUTION
 from main1 import run_engine, fetch_price_history, load_cashflows_external, modified_dietz_for_ticker_window, get_portfolio_horizon_start
 from io import BytesIO
+import matplotlib
+matplotlib.use("Agg")  # non-GUI backend; no windows
+
 import matplotlib.pyplot as plt
 import os
 from config import ETF_SECTOR_MAP
@@ -133,6 +135,9 @@ def build_report():
 
     # Run the engine (unchanged math)
     twr_df, sec_full, class_full, pv, twr_si, twr_si_annualized, pl_si = run_engine()
+    
+    twr_raw = twr_df.copy()  # keep numeric returns for excess-return calc
+
 
     cf_ext = load_cashflows_external()
 
@@ -1441,6 +1446,9 @@ def build_report():
         running *= (1 + R)
         twr_curve.loc[d] = running
 
+    # Unified since-inception anchor for both SI chart and SI benchmark table
+    si_start = inception_date
+
 
     # Slice only the MTD part
     twr_mtd = twr_curve[twr_curve.index >= mtd_start_twr]
@@ -1516,92 +1524,6 @@ def build_report():
         style="Normal"
     ).alignment = WD_ALIGN_PARAGRAPH.CENTER
     
-    # ---------------------------------------------------------------
-    # PERFORMANCE VS BENCHMARKS (MTD ONLY — TWR CONSISTENT)
-    # ---------------------------------------------------------------
-    doc.add_heading("Performance vs Benchmarks (MTD Only)", level=2)
-
-    # --- 1) Portfolio MTD TWR ---
-    # twr_df stores MTD under Horizon == "MTD"
-    portfolio_mtd_row = twr_df[twr_df["Horizon"] == "MTD"]
-    if not portfolio_mtd_row.empty:
-        portfolio_mtd_val = portfolio_mtd_row["Return"].iloc[0]
-    else:
-        portfolio_mtd_val = "N/A"
-
-    # --- 2) Benchmark MTD price returns (rebased like charts) ---
-    benchmarks = {
-        "S&P 500": "^GSPC",
-        "Global 60/40": "AOR",
-        "Conservative 40/60": "AOK"
-    }
-
-    # determine MTD start (same logic as charts)
-    mtd_start = twr_anchor
-    mtd_start_twr = twr_anchor
-
-
-
-    # ensures benchmarks use the SAME anchor as portfolio
-    mtd_start_twr = twr_anchor
-
-
-
-    bench_rows = []
-
-    for name, ticker in benchmarks.items():
-        try:
-            hist = fetch_price_history([ticker])
-            ser = hist[ticker].dropna()
-
-            # last benchmark price on or before prev_month_end
-            bench_dates = ser.index
-
-            # Align benchmark series to portfolio’s true MTD anchor
-            mtd_start_twr = twr_anchor
-            mtd_series = ser[ser.index >= twr_anchor]
-
-
-            if len(mtd_series) > 1:
-                bench_mtd = (mtd_series.iloc[-1] / mtd_series.iloc[0] - 1.0) * 100.0
-                bench_mtd_fmt = f"{bench_mtd:.2f}%"
-
-                if portfolio_mtd_val not in (None, "N/A"):
-                    port_float = float(str(portfolio_mtd_val).replace("%", ""))
-                    excess = port_float - bench_mtd
-                    excess_fmt = f"{excess:.2f}%"
-                else:
-                    excess_fmt = "N/A"
-            else:
-                bench_mtd_fmt = "N/A"
-                excess_fmt = "N/A"
-
-
-        except:
-            bench_mtd_fmt = "N/A"
-            excess_fmt = "N/A"
-
-        bench_rows.append([
-            name,
-            portfolio_mtd_val,
-            bench_mtd_fmt,
-            excess_fmt
-        ])
-
-
-    # Add table
-    add_table(
-        doc,
-        ["Benchmark", "Portfolio MTD %", "Benchmark MTD %", "Excess MTD %"],
-        bench_rows,
-        right_align=[1, 2, 3]
-    )
-
-    doc.add_paragraph(
-        "Note: Portfolio MTD uses true TWR; benchmarks use price returns rebased to the same start date."
-    )
-
-    doc.add_page_break()
     
     # ---------------- SINCE INCEPTION CHART (TWR vs Benchmarks) ----------------
     fig, ax = plt.subplots(figsize=(12, 6.5))
@@ -1617,8 +1539,8 @@ def build_report():
 
     # Portfolio since-inception TWR curve (twr_curve is already cumulative)
     twr_si_curve = twr_curve.copy()
-    si_start = twr_si_curve.index.min()
-    twr_si_pct = (twr_si_curve / twr_si_curve.iloc[0] - 1.0) * 100.0
+    twr_si_pct = (twr_si_curve - 1.0) * 100.0
+
 
     ax.plot(
         twr_si_pct.index,
@@ -1680,70 +1602,155 @@ def build_report():
         "Benchmarks use simple price returns rebased to the same since-inception start date.",
         style="Normal"
     ).alignment = WD_ALIGN_PARAGRAPH.CENTER
-
+    
+    doc.add_page_break()
 
     # ---------------------------------------------------------------
-    # PERFORMANCE VS BENCHMARKS (SINCE INCEPTION — TWR Consistent)
+    # PERFORMANCE VS BENCHMARKS (ALL HORIZONS — TWR CONSISTENT)
     # ---------------------------------------------------------------
-    doc.add_heading("Performance vs Benchmarks (Since Inception Only)", level=2)
+    doc.add_heading("Performance vs Benchmarks (All Horizons)", level=2)
 
-    # 1) Portfolio since-inception TWR (flow-adjusted)
-    # twr_si is a decimal (e.g., 0.1234); fmt_pct_clean turns it into "12.34%"
-    portfolio_si_val = fmt_pct_clean(twr_si)
+    # Horizons to show (must match your snapshot / twr_df + SI)
+    horizons_all = ["1D", "1W", "MTD", "1M", "3M", "6M", "1Y", "SI"]
 
-    # 2) Benchmark since-inception price returns
-    benchmarks_si = {
-        "S&P 500": "^GSPC",
-        "Global 60/40": "AOR",
-        "Conservative 40/60": "AOK",
+    # Portfolio TWR (numeric, decimals) from twr_raw
+    port_ret_num = {row["Horizon"]: row["Return"] for _, row in twr_raw.iterrows()}
+    port_ret_str = {row["Horizon"]: row["Return"] for _, row in twr_df.iterrows()}
+
+    # Inject SI (since inception) into both maps
+    if not pd.isna(twr_si):
+        port_ret_num["SI"] = twr_si
+        # use non-annualized SI TWR here for the table
+        port_ret_str["SI"] = fmt_pct_clean(twr_si)
+
+    # Benchmarks and their tickers (keys used for lookups below)
+    bm_defs = {
+        "S&P 500 %": "^GSPC",
+        "Global 60/40 %": "AOR",
+        "Conservative 40/60 %": "AOK",
     }
 
-    # Use the same anchor as the SI chart: first date in twr_curve
-    si_start = twr_curve.index.min()
-
-    bench_rows_si = []
-
-    for name, ticker in benchmarks_si.items():
+    # Cache benchmark price history once
+    bm_prices = {}
+    for col_label, ticker in bm_defs.items():
         try:
             hist = fetch_price_history([ticker])
-            series = hist[ticker].dropna()
-
-            # Align to since-inception anchor
-            series = series[series.index >= si_start]
-
-            if len(series) > 1:
-                bench_si = (series.iloc[-1] / series.iloc[0] - 1.0) * 100.0
-                bench_si_fmt = f"{bench_si:.2f}%"
-
-                if portfolio_si_val not in ("N/A", None):
-                    port_float = float(str(portfolio_si_val).replace("%", ""))
-                    excess = port_float - bench_si
-                    excess_fmt = f"{excess:.2f}%"
-                else:
-                    excess_fmt = "N/A"
-            else:
-                bench_si_fmt = "N/A"
-                excess_fmt = "N/A"
-
+            ser = hist[ticker].dropna()
         except Exception:
-            bench_si_fmt = "N/A"
-            excess_fmt = "N/A"
+            ser = pd.Series(dtype=float)
+        bm_prices[col_label] = ser
 
-        bench_rows_si.append([
-            name,
-            portfolio_si_val,
-            bench_si_fmt,
-            excess_fmt,
+    # Benchmark return as a decimal, rebased to same start as portfolio
+    def compute_bm_ret_decimal(col_label: str, horizon: str) -> float:
+        ser = bm_prices[col_label]
+        if ser.empty:
+            return np.nan
+
+        if horizon == "SI":
+            start = si_start  # same since-inception start used in the SI chart
+        else:
+            start = get_horizon_start(horizon)
+
+        if start is None:
+            return np.nan
+
+        ser_h = ser[ser.index >= start]
+        if len(ser_h) < 2:
+            return np.nan
+
+        return ser_h.iloc[-1] / ser_h.iloc[0] - 1.0  # decimal
+
+    # Build table rows with excess return columns
+    combined_rows = []
+    for h in horizons_all:
+        port_str = port_ret_str.get(h, "N/A")
+        port_dec = port_ret_num.get(h, np.nan)
+
+        sp_dec   = compute_bm_ret_decimal("S&P 500 %", h)
+        g6040_dec = compute_bm_ret_decimal("Global 60/40 %", h)
+        c4060_dec = compute_bm_ret_decimal("Conservative 40/60 %", h)
+
+        # Benchmark display strings
+        sp_str    = fmt_pct_clean(sp_dec)
+        g6040_str = fmt_pct_clean(g6040_dec)
+        c4060_str = fmt_pct_clean(c4060_dec)
+
+        # Excess = portfolio − benchmark (all decimals)
+        if pd.isna(port_dec) or pd.isna(sp_dec):
+            sp_excess_str = "N/A"
+        else:
+            sp_excess_str = fmt_pct_clean(port_dec - sp_dec)
+
+        if pd.isna(port_dec) or pd.isna(g6040_dec):
+            g6040_excess_str = "N/A"
+        else:
+            g6040_excess_str = fmt_pct_clean(port_dec - g6040_dec)
+
+        if pd.isna(port_dec) or pd.isna(c4060_dec):
+            c4060_excess_str = "N/A"
+        else:
+            c4060_excess_str = fmt_pct_clean(port_dec - c4060_dec)
+
+        combined_rows.append([
+            h,
+            port_str,
+            sp_str,
+            sp_excess_str,
+            g6040_str,
+            g6040_excess_str,
+            c4060_str,
+            c4060_excess_str,
         ])
+
+    # Shorten last header label to stop wrapping
+    headers = [
+        "Horizon",
+        "Portfolio %",
+        "S&P 500 %",
+        "Excess",
+        "Global 60/40 %",
+        "Excess",
+        "Cons 40/60 %",
+        "Excess",
+    ]
 
     add_table(
         doc,
-        ["Benchmark", "Portfolio SI %", "Benchmark SI %", "Excess SI %"],
-        bench_rows_si,
-        right_align=[1, 2, 3]
+        headers,
+        combined_rows,
+        right_align=[1, 2, 3, 4, 5, 6, 7]
+    )
+    
+    # ---- FIX WIDTHS ONLY FOR THIS BENCHMARKS TABLE ----
+    table = doc.tables[-1]          # get last added table
+    table.autofit = False
+    table.allow_autofit = False
+
+    col_widths = [
+        Inches(0.9),  # Horizon
+        Inches(0.9),  # Portfolio %
+        Inches(0.9),  # S&P 500 %
+        Inches(0.9),  # Excess vs S&P
+        Inches(1.15),  # Global 60/40 %
+        Inches(0.9),  # Excess vs 60/40
+        Inches(1.1),  # Cons 40/60 %
+        Inches(0.9),  # Excess vs 40/60
+    ]
+
+    for i, w in enumerate(col_widths):
+        for row in table.rows:
+            row.cells[i].width = w
+
+
+    doc.add_paragraph(
+        "Portfolio % uses flow-adjusted TWR. Benchmark % uses simple price returns "
+        "rebased to the same start date for each horizon. Excess = Portfolio % minus benchmark % for the same horizon.",
+        style="Normal"
     )
 
     doc.add_page_break()
+
+
 
     # =============================================================
     # NEW: SINCE-INCEPTION (SI) RETURNS FOR TICKERS & ASSET CLASSES
