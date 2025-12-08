@@ -1415,7 +1415,7 @@ def build_report():
 
     # ---------------- MTD TWR-BASED CHART ----------------
     doc.add_page_break()
-    doc.add_heading("Time-Series Performance Charts", level=1)
+    doc.add_heading("Portfolio vs Benchmarks Analysis", level=1)
     doc.add_heading("MTD Cumulative Return — Portfolio vs Benchmarks", level=2)
 
     # 1) Portfolio TWR cumulative curve (based on pv)
