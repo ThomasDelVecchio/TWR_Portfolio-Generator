@@ -2376,22 +2376,11 @@ def build_report():
     else:
         ext_series = pd.Series(0.0, index=pv_daily.index)
 
-    # ---------------- INTERNAL FLOWS (Buys/Sells) ----------------
-    tx_all = load_transactions_raw().copy()
-    if not tx_all.empty:
-        tx_all = tx_all.sort_values("date")
-        internal_series = (
-            tx_all.groupby("date")["amount"]
-            .sum()
-            .reindex(pv_daily.index, fill_value=0.0)
-        )
-    else:
-        internal_series = pd.Series(0.0, index=pv_daily.index)
-        
-
     # ---------------- MARKET EFFECT ----------------
-    # Residual after removing BOTH external + internal flows
-    mkt_series = dpv - ext_series - internal_series
+    # Residual after removing EXTERNAL flows only.
+    # Internal trades (buys/sells) are pure reallocations between
+    # cash and positions and should not change total PV.
+    mkt_series = dpv - ext_series
 
 
     # Last 30 days window
@@ -2403,11 +2392,12 @@ def build_report():
     dates_win = pv_daily.index[mask]
     dpv_win = dpv[mask]
     ext_win = ext_series[mask]
-    internal_win = internal_series[mask]
     mkt_win = mkt_series[mask]
 
     # Cumulative ΔPV (rebased to 0)
-    cum_total = (ext_series + internal_series + mkt_series).cumsum()
+    # ΔPV is exactly External + Market in this construction.
+    cum_total = (ext_series + mkt_series).cumsum()
+
     cum_win = cum_total[mask] - cum_total[mask].iloc[0]
 
     import matplotlib.dates as mdates
@@ -2422,24 +2412,15 @@ def build_report():
         width=0.9,
     )
 
-    # Internal flows layer (stacked on external)
-    ax1.bar(
-        dates_win,
-        internal_win,
-        bottom=ext_win,
-        label="Internal Flows",
-        width=0.9,
-    )
-
-    # Market effects layer (stacked on external + internal)
+    # Market effects layer (stacked on external)
+    # External + Market = total ΔPV
     ax1.bar(
         dates_win,
         mkt_win,
-        bottom=ext_win + internal_win,
+        bottom=ext_win,
         label="Market Effects",
         width=0.9,
     )
-
 
     ax1.set_ylabel("Δ Portfolio Value ($)")
     ax1.set_title("")
@@ -2893,4 +2874,3 @@ def build_report():
 
 if __name__ == "__main__":
     build_report()
-
