@@ -362,68 +362,68 @@ def compute_period_twr(
     end_date: pd.Timestamp,
 ) -> float:
     """
-    True TWR over [start_date, end_date] given:
-      - pv: full daily portfolio value series
-      - cf: full external cashflow table (date, amount)
+    True TWR over [start_date, end_date].
+
+    Assumptions:
+      - pv: daily portfolio value series (END-of-day values)
+      - cf: external cashflows (date, amount)
+      - flows with date D are applied at START-of-day D
+      - flows on the start_date are part of opening capital (not adjusted again)
     """
-    pv_window = pv[(pv.index >= start_date) & (pv.index <= end_date)]
+    # 1) Restrict PV to horizon
+    pv_window = pv[(pv.index >= start_date) & (pv.index <= end_date)].sort_index()
     if pv_window.empty or len(pv_window) < 2:
         return np.nan
 
+    # 2) Restrict flows: strictly AFTER first PV date, up to and including last
     cf_window = cf[
-        (cf["date"] > pv_window.index.min())   # strictly AFTER start
+        (cf["date"] > pv_window.index.min())
         & (cf["date"] <= pv_window.index.max())
-    ].sort_values("date")
+    ].copy()
 
-
+    # No flows in window → simple holding-period TWR
     if cf_window.empty:
-        # No flows in the window: simple holding-period return
-        return pv_window.iloc[-1] / pv_window.iloc[0] - 1.0
+        return float(pv_window.iloc[-1] / pv_window.iloc[0] - 1.0)
 
-    # --- FIX: aggregate flows by date to avoid double-counting ---
+    # 3) Aggregate flows by date
     cf_agg = (
         cf_window.groupby("date", as_index=False)["amount"]
         .sum()
         .sort_values("date")
     )
 
-    boundaries = (
-        [pv_window.index.min()]
-        + cf_agg["date"].tolist()
-        + [pv_window.index.max()]
+    # 4) Align flows to PV dates:
+    #    flow on date d is applied at start-of-day d, before pv[d] is observed
+    flow_series = (
+        cf_agg.set_index("date")["amount"]
+        .reindex(pv_window.index, fill_value=0.0)
     )
 
-    sub_returns = []
+    pv_prev = float(pv_window.iloc[0])
+    factors: list[float] = []
 
-    for i in range(len(boundaries) - 1):
-        start = pv_window.index[
-            pv_window.index.get_indexer([boundaries[i]], method="backfill")[0]
-        ]
-        end = pv_window.index[
-            pv_window.index.get_indexer([boundaries[i+1]], method="backfill")[0]
-        ]
+    # 5) Walk day-by-day and chain daily TWRs
+    for curr_date, pv_curr in pv_window.iloc[1:].items():
+        flow_today = float(flow_series.loc[curr_date])
 
-        pv_start = pv_window.loc[start]
-        pv_end   = pv_window.loc[end]
-
-        # each boundary corresponds to EXACTLY one aggregated flow
-        if i < len(cf_agg):
-            cf_amt = cf_agg.iloc[i]["amount"]
-        else:
-            cf_amt = 0.0
-
-        denom = pv_start + cf_amt
-        if denom <= 0:
+        # Capital invested for this day
+        base = pv_prev + flow_today
+        if base <= 0:
+            # Skip pathological segments (zero/negative base)
+            pv_prev = pv_curr
             continue
 
-        r = (pv_end - denom) / denom
-        sub_returns.append(1.0 + r)
+        r = (float(pv_curr) - base) / base
+        factors.append(1.0 + r)
 
+        pv_prev = float(pv_curr)
 
-    if not sub_returns:
+    if not factors:
         return np.nan
 
-    return np.prod(sub_returns) - 1.0
+    return float(np.prod(factors) - 1.0)
+
+
 
 def get_portfolio_horizon_start(
     pv: pd.Series,
