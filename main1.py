@@ -81,7 +81,12 @@ def load_cashflows_external(path: str = CASHFLOWS_FILE) -> pd.DataFrame:
     df["date"] = pd.to_datetime(df["date"])
     df["amount"] = df["amount"].astype(float)
 
-    if "ticker" in df.columns and "shares" in df.columns:
+    if "type" in df.columns:
+        df["type"] = df["type"].fillna("").astype(str).str.upper()
+        # Only keep explicit FLOW types (deposits/withdrawals)
+        external = df[df["type"] == "FLOW"].copy()
+        df = external[["date", "amount"]]
+    elif "ticker" in df.columns and "shares" in df.columns:
         df["ticker"] = df["ticker"].fillna("").astype(str).str.upper()
         df["shares"] = df["shares"].fillna(0.0).astype(float)
         # External flows: CASH or zero-share rows
@@ -119,10 +124,40 @@ def load_transactions_raw(path: str = CASHFLOWS_FILE) -> pd.DataFrame:
     df["amount"] = df["amount"].astype(float)
 
     # Drop external CASH flows: they are for portfolio TWR, not security-level
-    df = df[df["ticker"] != "CASH"].copy()
+    if "type" in df.columns:
+        df["type"] = df["type"].fillna("").astype(str).str.upper()
+        # Keep only TRADES for MD (exclude FLOW and DIVIDEND to avoid double counting with Adj Close)
+        df = df[df["type"] == "TRADE"].copy()
+    else:
+        df = df[df["ticker"] != "CASH"].copy()
 
     df = df.sort_values(["ticker", "date"]).reset_index(drop=True)
     return df
+
+
+# ------------------------------------------------------------
+# Load DIVIDENDS for Reporting (Income)
+# ------------------------------------------------------------
+
+def load_dividends(path: str = CASHFLOWS_FILE) -> pd.DataFrame:
+    """
+    Load rows marked as 'DIVIDEND' to report as Income.
+    """
+    df = pd.read_csv(path)
+    df.columns = [c.lower() for c in df.columns]
+
+    # If no 'type' column, no dividends to load
+    if "type" not in df.columns:
+        return pd.DataFrame(columns=["date", "ticker", "shares", "amount"])
+
+    df["type"] = df["type"].fillna("").astype(str).str.upper()
+    df["date"] = pd.to_datetime(df["date"])
+    df["amount"] = df["amount"].astype(float)
+    df["ticker"] = df["ticker"].fillna("").astype(str).str.upper()
+
+    divs = df[df["type"] == "DIVIDEND"].copy()
+    divs = divs.sort_values("date").reset_index(drop=True)
+    return divs
 
 
 # ------------------------------------------------------------
