@@ -8,7 +8,7 @@ from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
 from docx2pdf import convert
 from config import TARGET_PORTFOLIO_VALUE, TARGET_MONTHLY_CONTRIBUTION
-from main1 import run_engine, fetch_price_history, load_cashflows_external, modified_dietz_for_ticker_window, get_portfolio_horizon_start
+from main1 import run_engine, fetch_price_history, load_cashflows_external, modified_dietz_for_ticker_window, get_portfolio_horizon_start, load_dividends
 from io import BytesIO
 import matplotlib
 matplotlib.use("Agg")  # non-GUI backend; no windows
@@ -700,22 +700,35 @@ def build_report():
     if tx_raw.empty:
         ytd_buys = 0.0
         ytd_sells = 0.0
-        net_ytd_internal = 0.0
         most_recent_tx = None
     else:
         # buys = negative amounts (cash out)
         ytd_buys = tx_raw.loc[tx_raw["amount"] < 0, "amount"].sum()
         ytd_sells = tx_raw.loc[tx_raw["amount"] > 0, "amount"].sum()
-        net_ytd_internal = ytd_buys + ytd_sells
         most_recent_tx = tx_raw["date"].max()
 
+    # Income (Dividends)
+    div_raw = load_dividends().copy()
+    div_raw = div_raw[div_raw["date"] >= ytd_start].sort_values("date")
+
+    if div_raw.empty:
+        ytd_income = 0.0
+        most_recent_div = None
+    else:
+        ytd_income = div_raw["amount"].sum()
+        most_recent_div = div_raw["date"].max()
+
+    # Net Internal
+    net_ytd_internal = ytd_buys + ytd_sells + ytd_income
+
     # Choose the most recent of ANY flow
-    if most_recent_ext and most_recent_tx:
-        most_recent_any = max(most_recent_ext, most_recent_tx).strftime("%Y-%m-%d")
-    elif most_recent_ext:
-        most_recent_any = most_recent_ext.strftime("%Y-%m-%d")
-    elif most_recent_tx:
-        most_recent_any = most_recent_tx.strftime("%Y-%m-%d")
+    dates_list = []
+    if most_recent_ext: dates_list.append(most_recent_ext)
+    if most_recent_tx: dates_list.append(most_recent_tx)
+    if most_recent_div: dates_list.append(most_recent_div)
+
+    if dates_list:
+        most_recent_any = max(dates_list).strftime("%Y-%m-%d")
     else:
         most_recent_any = "N/A"
 
@@ -723,9 +736,10 @@ def build_report():
         ["YTD Net External Flows", fmt_dollar_clean(net_ytd_ext)],
         ["• YTD Deposits", fmt_dollar_clean(ytd_deposits)],
         ["• YTD Withdrawals", fmt_dollar_clean(ytd_withdrawals)],
-        ["YTD Net Internal Trading Flows", fmt_dollar_clean(net_ytd_internal)],
+        ["YTD Net Internal Activity", fmt_dollar_clean(net_ytd_internal)],
         ["• YTD Buys (Cash Out)", fmt_dollar_clean(ytd_buys)],
         ["• YTD Sells (Cash In)", fmt_dollar_clean(ytd_sells)],
+        ["• YTD Income (Divs)", fmt_dollar_clean(ytd_income)],
         ["Most Recent Flow", most_recent_any],
     ]
 
@@ -2195,43 +2209,78 @@ def build_report():
     doc.add_paragraph().paragraph_format.space_before = Pt(6)
 
     # ===============================================================
-    # INTERNAL TRADING SUMMARY (Buys, Sells, Net)
+    # INTERNAL TRADING SUMMARY (Buys, Sells, Net, Income)
     # ===============================================================
     doc.add_heading("Internal Trading Summary (Since Inception)", level=2)
 
     tx_all = load_transactions_raw().copy()
-    tx_all = tx_all.sort_values("date")
+    div_all = load_dividends().copy()
 
-    if tx_all.empty:
-        doc.add_paragraph("No internal trading activity available.")
+    if tx_all.empty and div_all.empty:
+        doc.add_paragraph("No internal trading or income activity available.")
     else:
-        # Aggregate buys (negative amounts) and sells (positive amounts) per ticker
-        summary = (
-            tx_all.groupby("ticker")["amount"]
-            .agg([
-                ("buys", lambda s: s[s < 0].sum()),
-                ("sells", lambda s: s[s > 0].sum())
-            ])
-            .reset_index()
-        )
+        # 1) Aggregate buys/sells
+        if tx_all.empty:
+            summary = pd.DataFrame(columns=["ticker", "buys", "sells"])
+        else:
+            summary = (
+                tx_all.groupby("ticker")["amount"]
+                .agg([
+                    ("buys", lambda s: s[s < 0].sum()),
+                    ("sells", lambda s: s[s > 0].sum())
+                ])
+                .reset_index()
+            )
 
-        summary["net"] = summary["buys"] + summary["sells"]
+        # 2) Aggregate dividends (income)
+        if div_all.empty:
+            div_agg = pd.DataFrame(columns=["ticker", "income"])
+        else:
+            div_agg = (
+                div_all.groupby("ticker")["amount"]
+                .sum()
+                .reset_index()
+                .rename(columns={"amount": "income"})
+            )
+
+        # 3) Merge
+        if summary.empty and not div_agg.empty:
+            final = div_agg
+            final["buys"] = 0.0
+            final["sells"] = 0.0
+        elif not summary.empty:
+            final = summary.merge(div_agg, on="ticker", how="outer")
+            final = final.fillna(0.0)
+        else:
+            final = pd.DataFrame(columns=["ticker", "buys", "sells", "income"])
+
+        # 4) Compute Net
+        if "income" not in final.columns:
+            final["income"] = 0.0
+        if "buys" not in final.columns:
+            final["buys"] = 0.0
+        if "sells" not in final.columns:
+            final["sells"] = 0.0
+
+        final["net"] = final["buys"] + final["sells"] + final["income"]
+        final = final.sort_values("ticker")
 
         # Format rows for display
         rows = []
-        for _, r in summary.iterrows():
+        for _, r in final.iterrows():
             rows.append([
                 r["ticker"],
                 fmt_dollar_clean(r["buys"]),
                 fmt_dollar_clean(r["sells"]),
+                fmt_dollar_clean(r["income"]),
                 fmt_dollar_clean(r["net"])
             ])
 
         add_table(
             doc,
-            ["Ticker", "Total Buys (Cash Out)", "Total Sells (Cash In)", "Net (Cash Flow)"],
+            ["Ticker", "Total Buys (Cash Out)", "Total Sells (Cash In)", "Total Income", "Net (Cash Flow)"],
             rows,
-            right_align=[1, 2, 3]
+            right_align=[1, 2, 3, 4]
         )
 
     # ---------------------------------------------------------------
@@ -2250,7 +2299,7 @@ def build_report():
             .set_index("ticker")["asset_class"]
             .to_dict()
         )
-        tx_raw["asset_class"] = tx_raw["ticker"].map(asset_map).fillna("Unknown")
+        tx_raw["asset_class"] = tx_raw["ticker"].map(asset_map).fillna("Exited Holdings")
 
         # Net flows per class
         net_by_class = (
@@ -2867,7 +2916,7 @@ def build_report():
     except:
         pass
 
-    print("✔ Report generated:")
+    print("[OK] Report generated:")
     print("   -", DOCX_NAME)
     print("   -", PDF_NAME)
 
