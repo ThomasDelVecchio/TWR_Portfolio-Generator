@@ -672,6 +672,8 @@ def build_report():
     # ---------------------------------------------------------------
     # TICKER ALLOCATION VS TARGET BAR CHART
     # ---------------------------------------------------------------
+    
+    # Use already loaded holdings_df
 
     # Merge actual values from sec_only with target_pct
     ticker_merge = sec_only[["ticker", "value"]].merge(
@@ -702,6 +704,8 @@ def build_report():
     # ---------------------------------------------------------------
     doc.add_page_break()
     doc.add_heading("Asset Class Allocation Breakdown", level=1)
+    
+    # Use already loaded holdings_df
 
     # Merge actual values from sec_only
     sec_only_grouped = (
