@@ -1549,6 +1549,44 @@ def build_report():
                     t_vals.append(get_ticker_pl_str(t, h))
                 rows_pl.append(t_vals)
 
+        # -------------------------------------------------------
+        # FIX: Add Cash / Reconciliation Row
+        # -------------------------------------------------------
+        cash_row = ["Cash / Reconciliation"]
+        
+        for h in horizons_pl:
+            # 1. Get Portfolio Total P/L (External Flows)
+            if h == "SI":
+                port_pl = pl_si # calculated in run_engine
+            else:
+                port_pl = calculate_horizon_pl(pv, inception_date, cf_ext, h)
+                
+            if port_pl is None:
+                cash_row.append("N/A")
+                continue
+                
+            # 2. Sum Ticker P/Ls (Internal Flows)
+            sum_ticker_pl = 0.0
+            
+            # Iterate all non-cash tickers
+            all_tickers = sec_only[sec_only["ticker"] != "CASH"]["ticker"].unique()
+            for t in all_tickers:
+                as_of_dt = pv.index.max()
+                if h == "SI":
+                    raw_start = None
+                else:
+                    raw_start = get_portfolio_horizon_start(pv, inception_date, h)
+                    
+                val = calculate_ticker_pl(t, h, prices, as_of_dt, tx_all_raw, sec_only, raw_start)
+                if val is not None:
+                    sum_ticker_pl += val
+                    
+            # 3. Diff is Cash P/L (captures interest, FX, drag, etc.)
+            diff = port_pl - sum_ticker_pl
+            cash_row.append(fmt_dollar_clean(diff))
+            
+        rows_pl.append(cash_row)
+
         add_table(
             doc,
             ["Asset Class / Ticker"] + horizons_pl,
@@ -1732,18 +1770,12 @@ def build_report():
     # ---------------------------------------------------------------
     doc.add_heading("Portfolio Value Analysis", level=1)
 
-    doc.add_heading("Portfolio Value — Mountain Chart (Since-Inception % Return)", level=2)
+    doc.add_heading("Portfolio Cumulative Return (Time-Weighted)", level=2)
 
-    # Build daily PV and forward-fill
-    pv_daily = pv.sort_index().reindex(
-        pd.date_range(pv.index.min(), pv.index.max(), freq="D")
-    ).ffill()
-
-    # Convert to % return since inception
-    pv0 = pv_daily.iloc[0]
-    pv_ret = (pv_daily / pv0 - 1.0) * 100.0
-
-    img_stream = plot_pv_mountain(pv_ret)
+    # FIX: Use calculated TWR series (twr_si_pct) instead of raw PV
+    # This ensures deposits/withdrawals do not distort the performance chart.
+    
+    img_stream = plot_pv_mountain(twr_si_pct)
 
     paragraph = doc.add_paragraph()
     run = paragraph.add_run()
@@ -1751,8 +1783,8 @@ def build_report():
     paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
     doc.add_paragraph(
-        "Figure: Portfolio value normalized to % return since inception. "
-        "Shows true performance shape even when dollar PV is flat.",
+        "Figure: Cumulative Time-Weighted Return (Growth of $100). "
+        "This metric isolates investment performance from external cash flows.",
         style="Normal"
     ).alignment = WD_ALIGN_PARAGRAPH.CENTER
 
