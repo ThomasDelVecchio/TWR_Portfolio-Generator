@@ -142,8 +142,9 @@ def load_dividends(path: str = CASHFLOWS_FILE) -> pd.DataFrame:
 
 def fetch_price_history(tickers, years_back: int = PRICE_LOOKBACK_YEARS) -> pd.DataFrame:
     # Normalize tickers to a hashable, order-independent cache key
-    tickers_list = list(tickers)
-    key = (tuple(sorted(str(t).upper() for t in tickers_list)), int(years_back))
+    # FIX: Deduplicate tickers list to safely check len() later
+    unique_tickers = sorted(list(set(str(t).upper() for t in tickers)))
+    key = (tuple(unique_tickers), int(years_back))
 
     if key in _PRICE_CACHE:
         # Return a copy so callers can't mutate the cached DataFrame in-place
@@ -151,16 +152,28 @@ def fetch_price_history(tickers, years_back: int = PRICE_LOOKBACK_YEARS) -> pd.D
 
     start_date = (datetime.today() - timedelta(days=365 * years_back)).strftime("%Y-%m-%d")
 
-    raw = yf.download(
-        tickers_list,
-        start=start_date,
-        progress=False,
-        auto_adjust=False,
-        group_by="column",
-    )
-
+    # Retry logic to handle occasional network/data gaps
+    raw = pd.DataFrame()
+    for attempt in range(3):
+        try:
+            raw = yf.download(
+                unique_tickers,
+                start=start_date,
+                progress=False,
+                auto_adjust=False,
+                group_by="column",
+            )
+            if not raw.empty:
+                break
+        except Exception:
+            pass
+        
     if raw.empty:
-        raise RuntimeError("yfinance returned no data. Check tickers or network.")
+        raise RuntimeError("yfinance returned no data after 3 attempts. Check tickers or network.")
+
+    # FIX 1: Strip timezones immediately (Yahoo sends UTC, your CSVs are naive)
+    if isinstance(raw.index, pd.DatetimeIndex) and raw.index.tz is not None:
+        raw.index = raw.index.tz_localize(None)
 
     # Handle both MultiIndex and flat columns cases
     if isinstance(raw.columns, pd.MultiIndex):
@@ -187,12 +200,19 @@ def fetch_price_history(tickers, years_back: int = PRICE_LOOKBACK_YEARS) -> pd.D
 
     prices = prices.ffill()
 
-    # Normalize column names to uppercase tickers
-    prices.columns = [str(c).upper() for c in prices.columns]
+    # FIX 2: If we have a single ticker, force the column name to be the ticker.
+    # Otherwise yfinance leaves it as "Adj Close" and your engine can't find the price.
+    if len(unique_tickers) == 1:
+        prices.columns = [unique_tickers[0]]
+    else:
+        # Normalize column names to uppercase tickers
+        prices.columns = [str(c).upper() for c in prices.columns]
 
     # Ensure datetime index
     if not isinstance(prices.index, pd.DatetimeIndex):
         prices.index = pd.to_datetime(prices.index)
+        if prices.index.tz is not None:
+             prices.index = prices.index.tz_localize(None)
 
     prices = prices.sort_index()
 
