@@ -438,11 +438,16 @@ def modified_dietz_for_ticker_window(
     # Clamp start to earliest price date
     if start < series.index.min():
         start = series.index.min()
-    if end <= start:
+    
+    # FIX: Allow start == end (0 days) for "Bought Today" scenarios
+    if end < start:
         return np.nan
 
     total_days = (end - start).days
-    if total_days <= 0:
+    if total_days == 0:
+        return 0.0
+    
+    if total_days < 0:
         return np.nan
 
     # Price at start: first on or after start
