@@ -942,7 +942,7 @@ def build_report():
 
     # Define benchmark tickers and fetch historical prices
     benchmarks = {
-        "S&P 500 (^GSPC)": "^GSPC",
+        "S&P 500 (SPY)": "SPY",
         "AOR (Global 60/40)": "AOR",
         "AOK (Conservative 40/60)": "AOK"
     }
@@ -1009,7 +1009,7 @@ def build_report():
 
     # 2) Benchmarks: ALSO anchored to the same start date as portfolio
     benchmark_map = {
-        "S&P 500 (^GSPC)": "^GSPC",
+        "S&P 500 (SPY)": "SPY",
         "AOR (Global 60/40)": "AOR",
         "AOK (Conservative 40/60)": "AOK"
     }
@@ -1108,7 +1108,7 @@ def build_report():
 
     # Benchmarks and their tickers (keys used for lookups below)
     bm_defs = {
-        "S&P 500 %": "^GSPC",
+        "S&P 500 %": "SPY",
         "Global 60/40 %": "AOR",
         "Conservative 40/60 %": "AOK",
     }
