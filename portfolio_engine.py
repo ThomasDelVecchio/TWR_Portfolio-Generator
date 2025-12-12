@@ -255,6 +255,84 @@ def run_engine():
                 np.nan,
             )
 
+    # =============================================================
+    # NEW: SINCE-INCEPTION (SI) RETURNS FOR TICKERS & ASSET CLASSES
+    # =============================================================
+    # (Copied from generate_report.py logic to ensure Dashboard matches PDF)
+    
+    si_return_map = {}
+    as_of_port = pv.index.max()
+
+    # Iterate over unique tickers in sec_table (excluding CASH)
+    for t in sec_table["ticker"].unique():
+        if t == "CASH":
+            si_return_map[t] = 0.0
+            continue
+
+        if t not in prices.columns:
+            si_return_map[t] = 0.0
+            continue
+
+        price_series = prices[t].dropna()
+        if price_series.empty:
+            si_return_map[t] = 0.0
+            continue
+            
+        # Get transactions for this ticker
+        tx_t = transactions_raw[transactions_raw["ticker"] == t].copy()
+        if tx_t.empty:
+            si_return_map[t] = 0.0
+            continue
+            
+        tx_t = tx_t.sort_values("date")
+        first_trade = tx_t["date"].min()
+        
+        # End date
+        as_of_price = price_series.index.max()
+        end = min(as_of_port, as_of_price)
+        
+        if end <= first_trade:
+            si_return_map[t] = 0.0
+            continue
+            
+        # Run MD
+        try:
+            si_ret = modified_dietz_for_ticker_window(
+                t,
+                price_series,
+                tx_t,
+                first_trade,
+                end,
+            )
+        except Exception:
+            si_ret = np.nan
+            
+        si_return_map[t] = float(si_ret) if pd.notna(si_ret) else np.nan
+
+    # Attach SI to sec_table
+    sec_table["SI"] = sec_table["ticker"].map(lambda t: si_return_map.get(t, 0.0))
+    
+    # Roll up to class_df (Value Weighted)
+    if not class_df.empty:
+        si_by_class = {}
+        # Need market value for weights. sec_table has it.
+        # Group sec_table by asset_class
+        for ac, grp in sec_table.groupby("asset_class"):
+            grp = grp.dropna(subset=["market_value"])
+            if grp.empty:
+                si_by_class[ac] = 0.0
+                continue
+                
+            sub = grp.dropna(subset=["SI"])
+            if sub.empty:
+                si_by_class[ac] = 0.0
+                continue
+                
+            w = sub["market_value"] / sub["market_value"].sum()
+            si_by_class[ac] = float((w * sub["SI"]).sum())
+            
+        class_df["SI"] = class_df["asset_class"].map(lambda ac: si_by_class.get(ac, 0.0))
+
     return twr_df, sec_table, class_df, pv, twr_since_inception, twr_since_inception_annualized, pl_since_inception
 
 
