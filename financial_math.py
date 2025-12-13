@@ -197,10 +197,10 @@ def compute_period_twr(
     if pv_window.empty or len(pv_window) < 2:
         return np.nan
 
-    # 2) Restrict flows: strictly AFTER first PV date, up to and including last
+    # 2) Restrict flows: strictly AFTER start_date, up to and including end_date
     cf_window = cf[
-        (cf["date"] > pv_window.index.min())
-        & (cf["date"] <= pv_window.index.max())
+        (cf["date"] > start_date)
+        & (cf["date"] <= end_date)
     ].copy()
 
     # No flows in window → simple holding-period TWR
@@ -506,6 +506,101 @@ def modified_dietz_for_ticker_window(
 
     return numer / denom
 
+def modified_dietz_for_asset_class_window(
+    tickers: list[str],
+    prices: pd.DataFrame,
+    tx_all: pd.DataFrame,
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+) -> float:
+    """
+    Modified Dietz return for an asset class over [start, end],
+    using aggregated cashflows and market values.
+    """
+    if not tickers:
+        return np.nan
+
+    total_days = (end - start).days
+    if total_days <= 0:
+        return 0.0
+
+    V0 = 0.0
+    V1 = 0.0
+
+    for ticker in tickers:
+        if ticker not in prices.columns:
+            continue
+        
+        price_series = prices[ticker].dropna()
+        if price_series.empty:
+            continue
+
+        # Clamp start to earliest price date for this ticker
+        effective_start = start
+        if effective_start < price_series.index.min():
+            effective_start = price_series.index.min()
+        
+        if end < effective_start:
+            continue
+
+        # Price at start: first on or after start
+        start_idx = price_series.index.searchsorted(effective_start)
+        if start_idx >= len(price_series):
+            continue
+        p_start = price_series.iloc[start_idx]
+
+        # Price at end: last on or before end
+        end_idx = price_series.index.searchsorted(end)
+        if end_idx == 0 and price_series.index[0] > end:
+            continue
+        if end_idx == len(price_series) or price_series.index[end_idx] > end:
+            end_idx -= 1
+        p_end = price_series.iloc[end_idx]
+
+
+        tx_ticker = tx_all[tx_all["ticker"] == ticker].sort_values("date").copy()
+        if tx_ticker.empty:
+            continue
+
+        tx_ticker["cum_shares"] = tx_ticker["shares"].cumsum()
+
+        def shares_on(date: pd.Timestamp) -> float:
+            mask = tx_ticker["date"] <= date
+            if not mask.any():
+                return 0.0
+            return float(tx_ticker.loc[mask, "cum_shares"].iloc[-1])
+
+        shares_start = shares_on(effective_start)
+        shares_end = shares_on(end)
+
+        V0 += shares_start * p_start
+        V1 += shares_end * p_end
+
+    # Aggregate cashflows for the asset class
+    tx_window = tx_all[
+        (tx_all["ticker"].isin(tickers)) &
+        (tx_all["date"] > start) &
+        (tx_all["date"] <= end)
+    ].copy()
+
+    if tx_window.empty:
+        if V0 <= 0:
+            return np.nan
+        return (V1 - V0) / V0 if V0 != 0 else np.nan
+
+    tx_window["C"] = -tx_window["amount"]
+    dates = tx_window["date"].tolist()
+    Cs = tx_window["C"].tolist()
+
+    weights = [(end - d).days / total_days for d in dates]
+    denom = V0 + sum(w * c for w, c in zip(weights, Cs))
+
+    if denom <= 0:
+        return np.nan
+
+    numer = V1 - V0 - sum(Cs)
+
+    return numer / denom
 
 def compute_security_modified_dietz(
     transactions: pd.DataFrame,
