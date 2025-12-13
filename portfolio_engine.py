@@ -7,6 +7,7 @@ from data_loader import (
     load_cashflows_external,
     load_transactions_raw,
     fetch_price_history,
+    load_dividends,
 )
 from financial_math import (
     build_portfolio_value_series_from_flows,
@@ -15,12 +16,13 @@ from financial_math import (
     compute_security_modified_dietz,
     get_portfolio_horizon_start,
     modified_dietz_for_ticker_window,
+    modified_dietz_for_asset_class_window,
     HORIZONS,
     ANNUALIZE_HORIZONS,
 )
 
 
-def run_engine():
+def run_engine(end_date=None):
     """
     Runs the full calculation pipeline but returns clean DataFrames instead of printing.
     NO math or logic is changed anywhere.
@@ -28,11 +30,78 @@ def run_engine():
     holdings = load_holdings()
     cashflows_ext = load_cashflows_external()
     transactions_raw = load_transactions_raw()
+    dividends = load_dividends()
 
-    tickers = sorted(
+    # Determine full ticker universe before any clipping
+    # This ensures we fetch prices for ALL tickers that appear in the full history,
+    # which is required because build_portfolio_value_series_from_flows reads the full cashflows file.
+    full_tickers = sorted(
         (set(holdings["ticker"]) | set(transactions_raw["ticker"])) - {"CASH"}
     )
-    prices = fetch_price_history(tickers)
+
+    # =============================================================
+    # TIME MACHINE LOGIC
+    # =============================================================
+    if end_date is not None:
+        end_date = pd.Timestamp(end_date)
+        
+        # 1. Clip Transactions & Flows
+        transactions_raw = transactions_raw[transactions_raw["date"] <= end_date]
+        cashflows_ext = cashflows_ext[cashflows_ext["date"] <= end_date]
+        dividends = dividends[dividends["date"] <= end_date]
+        
+        # 2. Reconstruct Holdings at end_date (Shares + Cash)
+        #    This is required so build_portfolio_value_series_from_flows 
+        #    sanity check passes, and mv_df reflects the correct point-in-time state.
+        
+        # Shares from trades
+        if not transactions_raw.empty:
+            computed_shares = transactions_raw.groupby("ticker")["shares"].sum()
+        else:
+            computed_shares = pd.Series(dtype=float)
+            
+        # Cash Balance (External + Net Trading + Dividends)
+        ext_cash = cashflows_ext["amount"].sum()
+        trading_cash = transactions_raw["amount"].sum() if not transactions_raw.empty else 0.0
+        div_cash = dividends["amount"].sum() if not dividends.empty else 0.0
+        total_cash = ext_cash + trading_cash + div_cash
+        
+        # Build new holdings rows
+        new_rows = []
+        for t, s in computed_shares.items():
+            if abs(s) > 1e-6:
+                new_rows.append({"ticker": t, "shares": s})
+        new_rows.append({"ticker": "CASH", "shares": total_cash})
+        
+        new_holdings = pd.DataFrame(new_rows)
+        
+        # Merge metadata (Asset Class, Target %) from original static file
+        # Note: Historical tickers not in current holdings will get defaults.
+        if not holdings.empty:
+            meta_cols = ["ticker", "asset_class", "target_pct"]
+            # Ensure columns exist in source
+            valid_cols = [c for c in meta_cols if c in holdings.columns]
+            if "ticker" in valid_cols:
+                new_holdings = new_holdings.merge(holdings[valid_cols], on="ticker", how="left")
+        
+        # Fill missing
+        if "asset_class" not in new_holdings.columns: new_holdings["asset_class"] = "Unknown"
+        if "target_pct" not in new_holdings.columns: new_holdings["target_pct"] = 0.0
+        
+        new_holdings["asset_class"] = new_holdings["asset_class"].fillna("Unknown")
+        new_holdings["target_pct"] = new_holdings["target_pct"].fillna(0.0)
+        
+        holdings = new_holdings
+
+    # Use the full universe of tickers so that build_portfolio_value_series_from_flows
+    # (which sees the entire cashflow history) finds columns for every ticker it encounters,
+    # even if that ticker has 0 positions/activity in the clipped window.
+    prices = fetch_price_history(full_tickers)
+    
+    # Clip Prices for Time Machine
+    if end_date is not None:
+        prices = prices[prices.index <= end_date]
+
     pv = build_portfolio_value_series_from_flows(holdings, prices)
 
     # =============================================================
@@ -127,9 +196,9 @@ def run_engine():
     mv_start = float(pv.loc[start])
     mv_end   = float(pv.loc[as_of])
 
-    # External flows strictly after start and strictly before end
+    # External flows strictly after start and up to and including end
     if not cashflows_ext.empty:
-        mask = (cashflows_ext["date"] > start) & (cashflows_ext["date"] < as_of)
+        mask = (cashflows_ext["date"] > start) & (cashflows_ext["date"] <= as_of)
         net_ext = float(cashflows_ext.loc[mask, "amount"].sum())
     else:
         net_ext = 0.0
@@ -185,34 +254,26 @@ def run_engine():
             sec_table[c] = np.nan
     sec_table = sec_table[cols_to_show].sort_values("market_value", ascending=False)
 
-    # ------ Asset-class MD (unchanged math) ------
-    md_with_class = sec_md_df.merge(
-        mv_df[["ticker", "asset_class", "market_value"]],
-        on="ticker",
-        how="left"
-    )
-
+    # ------ Asset-class MD (NEW: AGGREGATE MODIFIED DIETZ) ------
     class_rows = []
-    for asset_class, grp in md_with_class.groupby("asset_class"):
+    for asset_class, grp in holdings.groupby("asset_class"):
+        class_tickers = grp["ticker"].tolist()
         row = {"asset_class": asset_class}
-        grp = grp.dropna(subset=["market_value"])
-        total_mv = grp["market_value"].sum()
-        if total_mv <= 0:
-            for h in HORIZONS:
-                row[h] = np.nan
-            class_rows.append(row)
-            continue
 
         for h in HORIZONS:
-            if h in grp.columns:
-                sub = grp.dropna(subset=[h])
-                if sub.empty:
-                    row[h] = np.nan
-                else:
-                    w = sub["market_value"] / sub["market_value"].sum()
-                    row[h] = float((w * sub[h]).sum())
-            else:
+            start_date = get_portfolio_horizon_start(pv, inception_date, h)
+            if start_date is None or start_date >= as_of:
                 row[h] = np.nan
+                continue
+
+            ret = modified_dietz_for_asset_class_window(
+                tickers=class_tickers,
+                prices=prices,
+                tx_all=transactions_raw,
+                start=start_date,
+                end=as_of,
+            )
+            row[h] = ret
         class_rows.append(row)
 
     class_df = pd.DataFrame(class_rows)
@@ -223,6 +284,7 @@ def run_engine():
     class_df = class_df.merge(class_mv, on="asset_class", how="left")
     class_df = class_df.sort_values("class_market_value", ascending=False)
     class_df = class_df[["asset_class"] + HORIZONS]
+
 
     # ------ Annualize multi-year horizons (3Y, 5Y) for reporting ------
 
@@ -363,10 +425,10 @@ def calculate_horizon_pl(pv: pd.Series, inception_date: pd.Timestamp, cf_ext: pd
     mv_end   = float(pv.loc[as_of])
 
 
-    # flows strictly inside (start, as_of)
+    # flows strictly after start, up to and including as_of
     net_flows = 0.0
     if cf_ext is not None and not cf_ext.empty:
-        mask = (cf_ext["date"] > start) & (cf_ext["date"] < as_of)
+        mask = (cf_ext["date"] > start) & (cf_ext["date"] <= as_of)
         net_flows = float(cf_ext.loc[mask, "amount"].sum())
 
     pl = mv_end - mv_start - net_flows
@@ -486,7 +548,7 @@ def calculate_ticker_pl(ticker, h, prices, pv_as_of, transactions, sec_only, raw
     shares_start = tx.loc[mask, "shares"].sum() if mask.any() else 0.0
 
     # ----- Internal flows inside window -----
-    mask2 = (tx["date"] > start) & (tx["date"] < as_of)
+    mask2 = (tx["date"] > start) & (tx["date"] <= as_of)
     # Our file uses amount negative for buys (cash out), positive for sells (cash in).
     # When computing economic P/L, we subtract net internal flows (same as before).
     net_internal = -tx.loc[mask2, "amount"].sum()
