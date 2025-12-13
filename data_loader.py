@@ -8,7 +8,7 @@ import yfinance as yf
 # ============================================================
 HOLDINGS_FILE = "sample holdings.csv"
 CASHFLOWS_FILE = "cashflows.csv"
-PRICE_LOOKBACK_YEARS = 6
+PRICE_LOOKBACK_YEARS = 10
 
 # Simple in-memory cache for price history to keep horizons consistent
 _PRICE_CACHE = {}
@@ -219,3 +219,4 @@ def fetch_price_history(tickers, years_back: int = PRICE_LOOKBACK_YEARS) -> pd.D
     # Store in cache and return a copy
     _PRICE_CACHE[key] = prices
     return prices.copy()
+
