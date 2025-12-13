@@ -1287,97 +1287,8 @@ def build_report():
     # NEW: SINCE-INCEPTION (SI) RETURNS FOR TICKERS & ASSET CLASSES
     # =============================================================
 
-    # We want a true SI return per ticker (since first trade),
-    # and a value-weighted rollup for each asset class.
-    si_return_map = {}
-
-    tx_all = load_transactions_raw().copy()
-    as_of_port = pv.index.max()
-
-    # Use the same price history we already fetched for tickers
-    # (non-CASH only; CASH gets 0%).
-    for t in sec_only["ticker"].unique():
-        if t == "CASH":
-            si_return_map[t] = 0.0
-            continue
-
-        if t not in prices.columns:
-            # No price history → treat as 0% to avoid N/A spam
-            si_return_map[t] = 0.0
-            continue
-
-        price_series = prices[t].dropna()
-        if price_series.empty:
-            si_return_map[t] = 0.0
-            continue
-
-        tx_t = tx_all[tx_all["ticker"] == t].copy()
-        if tx_t.empty:
-            # No transactions recorded → fallback to 0%
-            si_return_map[t] = 0.0
-            continue
-
-        tx_t = tx_t.sort_values("date")
-        first_trade = tx_t["date"].min()
-
-        # End date = min(portfolio PV max date, price series max date)
-        as_of_price = price_series.index.max()
-        end = min(as_of_port, as_of_price)
-
-        if end <= first_trade:
-            si_return_map[t] = 0.0
-            continue
-
-        # Run MD from first trade date
-        try:
-            si_ret = modified_dietz_for_ticker_window(
-                t,
-                price_series,
-                tx_t,
-                first_trade,
-                end,
-            )
-        except Exception:
-            si_ret = np.nan
-
-        # If MD blows up to NaN, leave it as NaN so it shows as "N/A"
-        if pd.isna(si_ret):
-            si_return_map[t] = np.nan
-        else:
-            si_return_map[t] = float(si_ret)
-
-
-    # Attach SI returns to security-level table as a DECIMAL,
-    # then we will format for display in the horizon table only.
-    if not sec_full.empty:
-        sec_full["SI"] = sec_full["ticker"].map(lambda t: si_return_map.get(t, 0.0))
-
-    # Now roll these up to asset classes, value-weighted by current MV.
-    if not class_full.empty:
-        # Merge current market value into a helper frame
-        sec_mv = sec_only[["ticker", "asset_class", "value"]].copy()
-        sec_mv["SI"] = sec_mv["ticker"].map(lambda t: si_return_map.get(t, 0.0))
-
-        si_by_class = {}
-        for ac, grp in sec_mv.groupby("asset_class"):
-            grp = grp.dropna(subset=["value"])
-            if grp.empty:
-                si_by_class[ac] = 0.0
-                continue
-
-            # Only tickers with non-null SI
-            sub = grp.dropna(subset=["SI"])
-            if sub.empty:
-                si_by_class[ac] = 0.0
-                continue
-
-            w = sub["value"] / sub["value"].sum()
-            si_by_class[ac] = float((w * sub["SI"]).sum())
-
-        # Add SI as decimal to class_full
-        class_full["SI"] = class_full["asset_class"].map(
-            lambda ac: si_by_class.get(ac, 0.0)
-        )
+    # Note: SI returns are already calculated in portfolio_engine.py and included in sec_full / class_full.
+    # We simply need to ensure they are formatted as percentages for display.
 
     # Format ticker-level SI for display in the horizon table
     if not sec_full.empty and "SI" in sec_full.columns:
@@ -1552,7 +1463,7 @@ def build_report():
         # -------------------------------------------------------
         # FIX: Add Cash / Reconciliation Row
         # -------------------------------------------------------
-        cash_row = ["Cash / Reconciliation"]
+        cash_row = ["Cash / Recon"]
         
         for h in horizons_pl:
             # 1. Get Portfolio Total P/L (External Flows)
@@ -1611,8 +1522,7 @@ def build_report():
 
 
         doc.add_paragraph(
-            "P/L above is economic P/L by horizon (MV_end − MV_start − net internal flows), "
-            "rolled up additively from tickers to asset classes using the same horizon definitions as the Modified Dietz returns.",
+            "Economic P/L (MV End - MV Start - Net Flows) aligned to Modified Dietz horizons.",
             style="Normal"
         )
 
@@ -1620,7 +1530,7 @@ def build_report():
     # ---------------------------------------------------------------
     # DETAILED CASH FLOW REPORT (Since Inception)
     # ---------------------------------------------------------------
-    doc.add_page_break()
+ 
     doc.add_heading("Detailed Cash Flow Report", level=1)
 
     # ===============================================================
